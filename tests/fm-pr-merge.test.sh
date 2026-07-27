@@ -14,6 +14,12 @@
 #   (f) malformed PR URL fails fast without calling gh-axi
 #   (g) explicit merge method is not overridden by the default --squash
 #   (h) repo override args fail fast because the repo comes from the URL
+#
+# Every case that expects a merge seeds the task's verification ledger with a
+# record for the head the gh mock reports, because bin/fm-pr-merge.sh now
+# refuses to merge a commit it holds no local verification evidence for
+# (bin/fm-verify-lib.sh). tests/fm-merge-verification.test.sh owns that gate's
+# own coverage, including producing evidence through the real bin/fm-verify.sh.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -42,6 +48,15 @@ make_case() {
   printf '%s\n' "$case_dir"
 }
 
+# Seed a passing verification record for <head> so a case that is about merge
+# MECHANICS reaches the merge. The gate's own behavior is covered separately.
+seed_verified() {
+  local case_dir=$1 head=$2
+  printf 'verify\t%s\t%s\tpassed\ttest:passed\t-\n' "$(date +%s)" "$head" \
+    > "$case_dir/state/task-x1.verification"
+  chmod 600 "$case_dir/state/task-x1.verification"
+}
+
 # gh-axi mock recording every invocation to a log file, and gh mock answering
 # headRefOid for fm-pr-check.sh's pr_head lookup. Args: case_dir head_sha
 add_gh_mocks() {
@@ -68,7 +83,7 @@ SH
 # gh-axi mock that fails the merge call but succeeds everything else, so a
 # real merge failure is distinguishable from the recording step.
 add_gh_mocks_merge_fails() {
-  local case_dir=$1
+  local case_dir=$1 head=$2
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
@@ -77,8 +92,15 @@ case "${1:-} ${2:-}" in
 esac
 exit 0
 SH
-  cat > "$case_dir/fakebin/gh" <<'SH'
+  cat > "$case_dir/fakebin/gh" <<SH
 #!/usr/bin/env bash
+case "\${1:-} \${2:-}" in
+  "pr view")
+    case " \$* " in
+      *headRefOid*) printf '%s\n' '$head' ; exit 0 ;;
+    esac
+    ;;
+esac
 exit 0
 SH
   chmod +x "$case_dir/fakebin/gh-axi" "$case_dir/fakebin/gh"
@@ -104,6 +126,7 @@ test_records_pr_and_head_before_merging() {
   case_dir=$(make_case records-before-merge)
   mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" deadbeefcafefeed0000000000000000deadbeef
+  seed_verified "$case_dir" deadbeefcafefeed0000000000000000deadbeef
   : > "$case_dir/gh-axi.log"
 
   set +e
@@ -126,7 +149,8 @@ test_merge_failure_propagates_after_recording() {
   local case_dir rc
   case_dir=$(make_case merge-fails)
   mkdir -p "$case_dir/wt"
-  add_gh_mocks_merge_fails "$case_dir"
+  add_gh_mocks_merge_fails "$case_dir" 1111111111111111111111111111111111111111
+  seed_verified "$case_dir" 1111111111111111111111111111111111111111
   : > "$case_dir/gh-axi.log"
 
   set +e
@@ -146,6 +170,7 @@ test_extra_merge_args_forwarded() {
   case_dir=$(make_case extra-args)
   mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 2222222222222222222222222222222222222222
+  seed_verified "$case_dir" 2222222222222222222222222222222222222222
   : > "$case_dir/gh-axi.log"
 
   run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/15 -- --squash --delete-branch \
@@ -261,6 +286,7 @@ test_explicit_merge_method_not_overridden() {
   case_dir=$(make_case explicit-merge-method)
   mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 5555555555555555555555555555555555555555
+  seed_verified "$case_dir" 5555555555555555555555555555555555555555
   : > "$case_dir/gh-axi.log"
 
   run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/22 -- --merge \
@@ -276,6 +302,7 @@ test_method_equals_merge_method_not_overridden() {
   case_dir=$(make_case method-equals-merge-method)
   mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 7777777777777777777777777777777777777777
+  seed_verified "$case_dir" 7777777777777777777777777777777777777777
   : > "$case_dir/gh-axi.log"
 
   run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/23 -- --method=merge \
@@ -291,6 +318,7 @@ test_parses_pr_url_for_gh_axi() {
   case_dir=$(make_case url-parsing)
   mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" 6666666666666666666666666666666666666666
+  seed_verified "$case_dir" 6666666666666666666666666666666666666666
   : > "$case_dir/gh-axi.log"
 
   run_pr_merge "$case_dir" task-x1 https://github.com/my-org/my-repo/pull/126 \

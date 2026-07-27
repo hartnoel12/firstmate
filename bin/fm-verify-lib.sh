@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# fm-verify-lib.sh - firstmate's own truthful account of what a task's exact
+# commit was verified against, and the fail-closed merge refusal built on it.
+#
+# WHY THIS IS NOT A CI CHECK. The obvious gate - "refuse unless GitHub reports
+# every check green" - is unenforceable in this fleet by design of its budget.
+# Actions minutes run out, checks go dark, and a gate that cannot be satisfied
+# when it matters most is a gate agents route around. Verification here is
+# LOCAL: evidence that a command actually ran, at this exact commit, and exited
+# zero. Forge checks remain welcome corroboration and are never the requirement.
+#
+# WHY FIRSTMATE KEEPS ITS OWN RECORD. no-mistakes is a separate installed tool
+# and firstmate cannot change how it records. Verified 2026-07-26 against the
+# real ~/.no-mistakes/state.sqlite for run 01KYG4AK1MJJT2939M25AX7FAY, whose ci
+# step was force-approved over three failing checks: every step_results row
+# reads `completed|0` and its ci step_rounds row reads
+# `round=1, trigger_type=initial, selection_source=NULL, fix_summary=NULL` -
+# byte-identical to a step that genuinely passed. A record that overstates what
+# was verified is worse than no record, so the gate never consults that one.
+# See docs/verification/merge-verification-gate.md.
+#
+# THE LEDGER: state/<id>.verification, private (0600), append-only, one record
+# per line, TAB-separated, first field is the record kind. Writers sanitize TAB
+# and newline out of every field, so the line count is the record count.
+#
+#   verify   <epoch> <sha>      <outcome>  <steps>  <note>
+#   bypass   <epoch> <sha>      <what>     <why>    <by>
+#   override <epoch> <sha>      <path>     <reason> <by>
+#
+#   sha      full 40-hex commit the record is bound to ('-' for an unbound
+#            bypass, which can never be superseded by evidence)
+#   outcome  passed | failed - derived from real exit codes, never asserted
+#   steps    name:passed,name:failed,... in the order they ran
+#   what     comma-separated bypassed step names, or '*' for "the whole run"
+#
+# THE GATE (fm_verify_gate) refuses unless ALL of these hold for the exact
+# commit being merged:
+#
+#   1. a verify record exists whose sha equals that commit - a run on the same
+#      BRANCH is not evidence, because the branch moves;
+#   2. that record's outcome is passed and every step in it is passed;
+#   3. every step the project declares required (config/verify/<project>) has a
+#      passing record in it - a declared step absent from the run is a SKIPPED
+#      step, and skipped is not passed;
+#   4. no bypass recorded against the task survives. A bypass naming steps is
+#      superseded only by positive evidence: each named step must itself appear
+#      passing in the winning record for this exact commit. An unbound or '*'
+#      bypass can never be superseded, so it always refuses.
+#
+# Rule 4 is what makes an unaccounted-for bypass fail CLOSED. Recording a
+# bypass cannot make a merge easier - only harder - so the record has no
+# incentive to be omitted, and omitting it is the one failure mode firstmate
+# must not reward.
+#
+# Sourced by bin/fm-verify.sh, bin/fm-pr-merge.sh, bin/fm-merge-local.sh, and
+# the tests. No side effects on source. set -u / set -e safe.
+
+# Exit code every verification refusal uses, distinct from the gate-agent
+# refusal (3) so a caller or test can tell the two apart.
+# shellcheck disable=SC2034  # Read by the sourcing merge scripts and the tests.
+FM_VERIFY_REFUSE_EXIT=4
+
+# Environment acknowledgement the override demands in addition to its flag.
+# Two deliberate acts, so an override is never something a hurried agent
+# stumbles into as the path of least resistance.
+FM_VERIFY_OVERRIDE_ACK_VALUE='i-accept-merging-unverified-work'
+
+# Shortest reason the override accepts. A reason has to name the environmental
+# breakage; "ci down" leaves nothing behind for the next reader.
+FM_VERIFY_OVERRIDE_MIN_REASON=24
+
+# --- field hygiene ----------------------------------------------------------
+
+# fm_verify_field_clean <text>: echo <text> with TAB, CR, and LF folded to
+# single spaces and surrounding whitespace trimmed, so it cannot break the
+# record framing. An empty result echoes '-'.
+fm_verify_field_clean() {
+  local s=${1:-}
+  s=$(printf '%s' "$s" | tr '\t\r\n' '   ')
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  [ -n "$s" ] || s='-'
+  printf '%s' "$s"
+}
+
+# fm_verify_step_name_valid <name>: step names are the ledger's only structured
+# field, so keep them to a shape that can never collide with the ',' and ':'
+# separators.
+fm_verify_step_name_valid() {
+  case "${1:-}" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# fm_verify_sha_valid <sha>: a full 40-hex commit id. Short shas are rejected
+# on purpose - the whole point is binding evidence to one exact commit.
+fm_verify_sha_valid() {
+  case "${1:-}" in
+    *[!0-9a-f]*) return 1 ;;
+    ????????????????????????????????????????) return 0 ;;
+  esac
+  return 1
+}
+
+# --- ledger paths and writing ----------------------------------------------
+
+# fm_verify_ledger_path <state-dir> <task-id>
+fm_verify_ledger_path() {
+  printf '%s/%s.verification' "$1" "$2"
+}
+
+# fm_verify_append <ledger> <kind> <sha> <f4> <f5> <f6>: append one record with
+# 0600 permissions. Refuses a symlinked or non-regular ledger rather than
+# following it somewhere else.
+fm_verify_append() {
+  local ledger=$1 kind=$2 sha=$3 f4=$4 f5=$5 f6=$6 now
+  if [ -e "$ledger" ] && { [ -L "$ledger" ] || [ ! -f "$ledger" ]; }; then
+    echo "error: verification ledger is unavailable" >&2
+    return 1
+  fi
+  now=$(date +%s 2>/dev/null) || return 1
+  ( umask 077
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$kind" "$now" "$sha" \
+      "$(fm_verify_field_clean "$f4")" \
+      "$(fm_verify_field_clean "$f5")" \
+      "$(fm_verify_field_clean "$f6")" >> "$ledger" ) || return 1
+  chmod 0600 "$ledger" 2>/dev/null || true
+}
+
+# --- declared required steps ------------------------------------------------
+
+# fm_verify_config_path <config-dir> <project-path>: the optional per-project
+# declaration of what a complete verification is. Keyed on the project
+# directory's basename, the same name the project registry uses. Echoes nothing
+# when the project name is unusable as a single path segment.
+fm_verify_config_path() {
+  local config_dir=$1 project=$2 name
+  [ -n "$project" ] || return 0
+  name=$(basename -- "$project")
+  case "$name" in
+    ''|.|..|.*|*/*) return 0 ;;
+    *[!A-Za-z0-9._-]*) return 0 ;;
+  esac
+  printf '%s/verify/%s' "$config_dir" "$name"
+}
+
+# fm_verify_config_steps <config-file>: echo one "<step>\t<command>" line per
+# declared step. Blank lines and # comments are ignored; a line without '=' or
+# with an unusable step name is a configuration error, reported and refused, so
+# a typo silently lowers no bar.
+fm_verify_config_steps() {
+  local file=$1 line name cmd
+  [ -n "$file" ] && [ -f "$file" ] && [ ! -L "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*|[[:space:]]*'#'*) continue ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *)
+        [ -z "$(fm_verify_field_clean "$line")" ] && continue
+        echo "error: $file: expected '<step> = <command>', got: $line" >&2
+        return 1
+        ;;
+    esac
+    name=${line%%=*}
+    cmd=${line#*=}
+    name=$(fm_verify_field_clean "$name")
+    cmd=$(fm_verify_field_clean "$cmd")
+    if ! fm_verify_step_name_valid "$name"; then
+      echo "error: $file: invalid step name '$name'" >&2
+      return 1
+    fi
+    if [ "$cmd" = '-' ]; then
+      echo "error: $file: step '$name' declares no command" >&2
+      return 1
+    fi
+    printf '%s\t%s\n' "$name" "$cmd"
+  done < "$file"
+}
+
+# fm_verify_required_steps <config-file>: comma-separated declared step names,
+# empty when the project declares none.
+fm_verify_required_steps() {
+  local steps out
+  steps=$(fm_verify_config_steps "$1") || return 1
+  out=$(printf '%s' "$steps" | cut -f1 | paste -sd, - 2>/dev/null) || return 1
+  printf '%s' "$out"
+}
+
+# --- the gate ---------------------------------------------------------------
+
+# Set by fm_verify_gate on refusal: one plain sentence naming what is missing.
+FM_VERIFY_REFUSAL=''
+# Set by fm_verify_gate on success: the steps that carried the commit, for the
+# merge output, so a passing gate still says what it actually checked.
+FM_VERIFY_EVIDENCE=''
+
+# fm_verify_gate <ledger> <sha> <required-csv>: 0 when the exact commit has
+# genuine, complete, unbypassed local verification evidence. 1 otherwise, with
+# FM_VERIFY_REFUSAL explaining which of the four rules failed.
+fm_verify_gate() {  # <ledger> <sha> <required-csv>
+  local ledger=$1 sha=$2 required=${3:-}
+  local kind rec_sha win_outcome='' win_steps='' found=0
+  local outcome steps what why pair name status req verified=''
+  local -a parts=()
+
+  FM_VERIFY_REFUSAL=''
+  FM_VERIFY_EVIDENCE=''
+
+  if ! fm_verify_sha_valid "$sha"; then
+    FM_VERIFY_REFUSAL="cannot identify the exact commit to merge, so no verification evidence can be bound to it"
+    return 1
+  fi
+  if [ ! -f "$ledger" ] || [ -L "$ledger" ]; then
+    FM_VERIFY_REFUSAL="no verification evidence has been recorded for this task"
+    return 1
+  fi
+
+  # Rule 1: the winning record is the LAST verify record bound to this exact
+  # commit. Later re-verification of the same commit supersedes earlier runs;
+  # a run on any other commit is not evidence for this one.
+  while IFS=$'\t' read -r kind _ rec_sha outcome steps _; do
+    [ "$kind" = verify ] || continue
+    [ "$rec_sha" = "$sha" ] || continue
+    win_outcome=$outcome
+    win_steps=$steps
+    found=1
+  done < "$ledger"
+
+  if [ "$found" -eq 0 ]; then
+    FM_VERIFY_REFUSAL="no local verification run is recorded for commit $sha (a run on the same branch is not evidence: the branch moves)"
+    return 1
+  fi
+
+  # Rule 2: the run genuinely passed, step by step.
+  if [ "$win_outcome" != passed ]; then
+    FM_VERIFY_REFUSAL="the verification run recorded for commit $sha did not pass (outcome: $win_outcome)"
+    return 1
+  fi
+  if [ -z "$win_steps" ] || [ "$win_steps" = '-' ]; then
+    FM_VERIFY_REFUSAL="the verification run recorded for commit $sha checked nothing"
+    return 1
+  fi
+  IFS=',' read -r -a parts <<< "$win_steps"
+  for pair in "${parts[@]}"; do
+    name=${pair%%:*}
+    status=${pair#*:}
+    if [ -z "$name" ] || [ "$name" = "$pair" ]; then
+      FM_VERIFY_REFUSAL="the verification record for commit $sha is malformed and cannot be trusted"
+      return 1
+    fi
+    if [ "$status" != passed ]; then
+      FM_VERIFY_REFUSAL="verification step '$name' is recorded as $status for commit $sha"
+      return 1
+    fi
+    verified="$verified,$name,"
+  done
+
+  # Rule 3: a declared step missing from the run was skipped, and skipped is
+  # not passed.
+  if [ -n "$required" ]; then
+    IFS=',' read -r -a parts <<< "$required"
+    for req in "${parts[@]}"; do
+      [ -n "$req" ] || continue
+      case "$verified" in
+        *",$req,"*) ;;
+        *)
+          FM_VERIFY_REFUSAL="required verification step '$req' has no passing record for commit $sha (declared for this project but not run)"
+          return 1
+          ;;
+      esac
+    done
+  fi
+
+  # Rule 4: any recorded bypass survives unless the exact commit has positive
+  # evidence for every step it named.
+  while IFS=$'\t' read -r kind _ _ what why _; do
+    [ "$kind" = bypass ] || continue
+    if [ "$what" = '*' ] || [ "$what" = '-' ]; then
+      FM_VERIFY_REFUSAL="an unscoped bypass is recorded against this task ($why) and nothing can supersede it"
+      return 1
+    fi
+    IFS=',' read -r -a parts <<< "$what"
+    for name in "${parts[@]}"; do
+      [ -n "$name" ] || continue
+      case "$verified" in
+        *",$name,"*) ;;
+        *)
+          FM_VERIFY_REFUSAL="a bypass of '$name' is recorded against this task ($why) and '$name' has no passing record for commit $sha"
+          return 1
+          ;;
+      esac
+    done
+  done < "$ledger"
+
+  # shellcheck disable=SC2034  # Read by the sourcing merge scripts.
+  FM_VERIFY_EVIDENCE=$win_steps
+  return 0
+}
+
+# --- the override -----------------------------------------------------------
+
+# fm_verify_override_valid <reason>: 0 when the caller supplied both halves of
+# the deliberate act. Sets FM_VERIFY_REFUSAL with the missing half otherwise.
+fm_verify_override_valid() {  # <reason>
+  local reason=${1:-}
+  FM_VERIFY_REFUSAL=''
+  if [ "${#reason}" -lt "$FM_VERIFY_OVERRIDE_MIN_REASON" ]; then
+    FM_VERIFY_REFUSAL="--override-unverified needs a reason of at least $FM_VERIFY_OVERRIDE_MIN_REASON characters naming the concrete breakage"
+    return 1
+  fi
+  if [ "${FM_MERGE_OVERRIDE_ACK:-}" != "$FM_VERIFY_OVERRIDE_ACK_VALUE" ]; then
+    FM_VERIFY_REFUSAL="--override-unverified also requires FM_MERGE_OVERRIDE_ACK=$FM_VERIFY_OVERRIDE_ACK_VALUE in the environment"
+    return 1
+  fi
+  return 0
+}
+
+# fm_verify_override_announce <sha> <reason> <refusal>: the loud half. Printed
+# to BOTH stdout and stderr so it survives whichever stream the caller keeps.
+fm_verify_override_announce() {  # <sha> <reason> <refusal>
+  local sha=$1 reason=$2 refusal=$3 banner
+  banner=$(cat <<EOF
+################################################################################
+##  MERGING WITHOUT VERIFICATION EVIDENCE
+##  commit : $sha
+##  gate   : $refusal
+##  reason : $reason
+##  This override is recorded in the task's verification ledger and metadata.
+################################################################################
+EOF
+)
+  printf '%s\n' "$banner"
+  printf '%s\n' "$banner" >&2
+}
+
+# fm_verify_record_override <ledger> <meta> <sha> <reason> <path>: the durable
+# half. Writes the override to the ledger AND to task metadata, so the trail
+# survives losing either one. Fails the merge if it cannot record - an
+# unrecorded override is exactly the thing this whole file exists to prevent.
+fm_verify_record_override() {  # <ledger> <meta> <sha> <reason> <path>
+  local ledger=$1 meta=$2 sha=$3 reason=$4 path=$5 by
+  by=${USER:-${LOGNAME:-unknown}}
+  fm_verify_append "$ledger" override "$sha" "$path" "$reason" "$by" || return 1
+  if [ -f "$meta" ] && [ ! -L "$meta" ]; then
+    printf 'merged_unverified=%s|%s\n' "$sha" "$(fm_verify_field_clean "$reason")" >> "$meta" || return 1
+  fi
+  return 0
+}
+
+# fm_verify_refusal_report <merge-command> <verify-command>: the standard
+# refusal block. Names what is missing, then the two ways forward, honest first.
+fm_verify_refusal_report() {  # <merge-command> <verify-command>
+  {
+    printf 'REFUSED: %s\n' "$FM_VERIFY_REFUSAL"
+    printf '\n'
+    printf 'Nothing is merged. Firstmate will not land a commit it has no local\n'
+    printf 'evidence for; forge checks are corroboration, never the requirement.\n'
+    printf '\n'
+    printf 'To merge honestly, verify this exact commit and record the result:\n'
+    printf '  %s\n' "$2"
+    printf '\n'
+    printf 'If the verification itself is environmentally broken, the escape hatch is\n'
+    printf 'deliberate, loud, and permanently recorded against the task:\n'
+    printf '  FM_MERGE_OVERRIDE_ACK=%s \\\n' "$FM_VERIFY_OVERRIDE_ACK_VALUE"
+    printf '    %s --override-unverified "<what is broken, and why merging anyway is right>"\n' "$1"
+  } >&2
+}

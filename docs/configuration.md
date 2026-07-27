@@ -113,6 +113,29 @@ An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisel
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the current channel reference, [`verification/supervision.md`](verification/supervision.md#wedge-alarm-channels) for active evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
 
+## Merge verification evidence (config/verify/<project>)
+
+Both merge entrypoints refuse to land a commit Firstmate holds no local verification evidence for.
+The gate is deliberately local rather than CI-shaped: this fleet's forge checks go dark when its Actions budget runs out, and a gate that cannot be satisfied exactly when it matters is a gate that gets routed around.
+Forge checks remain welcome corroboration and are never the requirement.
+
+Evidence is produced by `bin/fm-verify.sh`, which runs the verification commands itself in the task's worktree and records the real exit codes against the exact commit; it cannot record a claim.
+The per-task ledger lives in `state/<id>.verification`, and `bin/fm-verify-lib.sh` is the single owner of its format, the four gate rules, the bypass record, and the override.
+
+An optional per-project file declares what a complete verification of that project is.
+It lives in the local, gitignored `config/verify/<project-name>`, keyed on the project directory's basename, and contains one `<step> = <command>` line per step, with `#` comments and blank lines ignored:
+
+```
+test = npm test
+lint = npm run lint
+```
+
+Declaring steps raises that project's bar in two places at once.
+`bin/fm-verify.sh run <task-id>` with no arguments runs exactly these steps, and the merge gate then requires every one of them to have a passing record for the commit being merged, so a declared step that never ran is a skipped step and the merge refuses.
+With no declaration the gate still requires a passing run bound to the exact commit, which is the floor rather than the ceiling.
+
+This file is local to each Firstmate home and is not part of secondmate inherited configuration.
+
 ## Gate defaults (.no-mistakes.yaml)
 
 The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and pins `commands.lint` to `bin/fm-lint.sh` so local lint matches CI.

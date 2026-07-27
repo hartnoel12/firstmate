@@ -49,7 +49,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `backends/cmux.sh`       | Experimental cmux session-provider adapter                                           |
 | `fm-config-push.sh`      | Push declared inherited local material to live secondmates mid-session and send a pointer to the literal-content config reread when config changed |
 | `fm-project-mode.sh`     | Resolve a project's delivery mode and `+yolo` flag from `data/projects.md`           |
-| `fm-merge-local.sh`      | Fast-forward a `local-only` project's local default branch after approval            |
+| `fm-merge-local.sh`      | Fast-forward a `local-only` project's local default branch after approval, refusing without verification evidence for the branch tip |
 | `fm-review-diff.sh`      | Review a crewmate branch or resolved PR head against the authoritative base          |
 | `fm-marker-lib.sh`       | Compatibility entry point for the from-firstmate carrier owned by `fm-operational-input.sh` |
 | `fm-pending-reply-lib.sh` | Parent-owned secondmate pending-reply expectations, recovery, and one-shot escalation |
@@ -82,7 +82,9 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-pr-poll.sh`          | Provide the byte-static watcher program for validated PR/MR-poll sidecars           |
 | `fm-pr-check-migrate.sh` | Quarantine older task polls without execution and rebuild only canonical polls       |
 | `fm-pr-check.sh`         | Record validated `pr=` and `pr_head=` values, then atomically arm a static merge poll |
-| `fm-pr-merge.sh`         | Record PR metadata, then merge a task's canonical full GitHub URL                    |
+| `fm-pr-merge.sh`         | Record PR metadata, then merge a task's canonical full GitHub URL, refusing without verification evidence for the PR head |
+| `fm-verify.sh`           | Run a task's verification steps at its exact commit and record the real result, or record an authorized bypass |
+| `fm-verify-lib.sh`       | Verification ledger format, the fail-closed merge gate both merge entrypoints enforce, and the recorded override |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-teardown.sh`         | Fail-closed teardown: return landed ship worktrees, require completed scout deliverables, retire secondmate homes |
 | `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |
