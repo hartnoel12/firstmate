@@ -380,11 +380,80 @@ fm_verify_file_link_count() {
   fi
 }
 
+# The rewrite's temp file is a 0600 copy of the task's metadata, including the
+# operator's free-text override reason, and it lives in the state directory
+# beside the real thing. bin/fm-teardown.sh removes only the named per-task
+# files, so a stranded copy would outlive its task. It is therefore removed on
+# every return path AND on signal, the way bin/fm-pr-check.sh guards its own
+# .fm-pr-meta temp. The signal handlers are installed only when the sourcing
+# script has none of its own, so a caller's traps are deferred to rather than
+# overwritten; the explicit removal covers that case.
+FM_VERIFY_META_TMP=''
+FM_VERIFY_META_TRAP_OWNED=0
+
+fm_verify_meta_tmp_cleanup() {
+  [ -z "${FM_VERIFY_META_TMP:-}" ] || rm -f -- "$FM_VERIFY_META_TMP"
+  FM_VERIFY_META_TMP=''
+}
+
+fm_verify_meta_trap_arm() {
+  FM_VERIFY_META_TRAP_OWNED=0
+  [ -z "$(trap -p EXIT HUP INT TERM 2>/dev/null)" ] || return 0
+  trap fm_verify_meta_tmp_cleanup EXIT
+  trap 'fm_verify_meta_tmp_cleanup; exit 1' HUP INT TERM
+  FM_VERIFY_META_TRAP_OWNED=1
+}
+
+fm_verify_meta_trap_disarm() {
+  [ "${FM_VERIFY_META_TRAP_OWNED:-0}" -eq 1 ] || return 0
+  trap - EXIT HUP INT TERM
+  FM_VERIFY_META_TRAP_OWNED=0
+}
+
+# fm_verify_meta_compose <meta> <tmp> <note>: copy <meta> to <tmp> with <note>
+# inserted before the first pr= line, or appended when there is none. Every
+# write is checked, so a filesystem that fills partway through fails the whole
+# operation instead of producing a plausible-looking truncation.
+fm_verify_meta_compose() {  # <meta> <tmp> <note>
+  local meta=$1 tmp=$2 note=$3 line inserted=0
+  : > "$tmp" || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$inserted" -eq 0 ]; then
+      case "$line" in
+        pr=*)
+          printf '%s\n' "$note" >> "$tmp" || return 1
+          inserted=1
+          ;;
+      esac
+    fi
+    printf '%s\n' "$line" >> "$tmp" || return 1
+  done < "$meta"
+  [ "$inserted" -eq 1 ] || printf '%s\n' "$note" >> "$tmp" || return 1
+  return 0
+}
+
+# fm_verify_meta_rewrite_faithful <meta> <tmp> <note>: 0 only when <tmp> is
+# <meta> with exactly one <note> line added and nothing else changed, moved, or
+# lost. Proving the note landed is not enough: the note is inserted immediately
+# before pr=, which bin/fm-pr-check.sh writes last, so a truncation right after
+# the note would leave the note present and the pr= identity gone.
+fm_verify_meta_rewrite_faithful() {  # <meta> <tmp> <note>
+  local meta=$1 tmp=$2 note=$3 added
+  added=$(awk -v note="$note" '$0 == note { n++ } END { print n + 0 }' "$tmp") || return 1
+  [ "$added" = 1 ] || return 1
+  awk -v note="$note" '
+    !dropped && $0 == note { dropped = 1; next }
+    { print }
+  ' "$tmp" 2>/dev/null | cmp -s - <(awk '{ print }' "$meta" 2>/dev/null)
+}
+
 # fm_verify_meta_note_override <meta> <sha> <reason>: write one
 # merged_unverified=<sha>|<reason> line into <meta>, before its first pr= line
-# or at the end when it has none.
+# or at the end when it has none. The original is left untouched unless the
+# replacement is proven complete, because an override that cannot be recorded
+# is an override that is not taken.
 fm_verify_meta_note_override() {  # <meta> <sha> <reason>
-  local meta=$1 sha=$2 reason=$3 dir device tmp note line inserted=0
+  local meta=$1 sha=$2 reason=$3 dir device note rc=0
   [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
   [ "$(fm_verify_file_link_count "$meta")" = 1 ] || return 1
   dir=$(dirname -- "$meta")
@@ -392,31 +461,35 @@ fm_verify_meta_note_override() {  # <meta> <sha> <reason>
   [ -n "$device" ] || return 1
   [ "$(fm_verify_file_device "$meta")" = "$device" ] || return 1
   note="merged_unverified=$sha|$(fm_verify_field_clean "$reason")"
-  tmp=$(mktemp "$dir/.fm-verify-meta.XXXXXX") || return 1
-  if ! {
-      while IFS= read -r line || [ -n "$line" ]; do
-        if [ "$inserted" -eq 0 ]; then
-          case "$line" in
-            pr=*) printf '%s\n' "$note" && inserted=1 ;;
-          esac
-        fi
-        printf '%s\n' "$line"
-      done < "$meta"
-      [ "$inserted" -eq 1 ] || printf '%s\n' "$note"
-    } > "$tmp"; then
-    rm -f -- "$tmp"
+
+  fm_verify_meta_trap_arm
+  FM_VERIFY_META_TMP=$(mktemp "$dir/.fm-verify-meta.XXXXXX") || {
+    fm_verify_meta_trap_disarm
     return 1
-  fi
-  if ! chmod 0600 "$tmp" \
-    || ! grep -qxF -- "$note" "$tmp" \
-    || [ "$(fm_verify_file_device "$tmp")" != "$device" ] \
+  }
+  if ! fm_verify_meta_compose "$meta" "$FM_VERIFY_META_TMP" "$note" \
+    || ! fm_verify_meta_rewrite_faithful "$meta" "$FM_VERIFY_META_TMP" "$note" \
+    || ! chmod 0600 "$FM_VERIFY_META_TMP" \
+    || [ "$(fm_verify_file_device "$FM_VERIFY_META_TMP")" != "$device" ] \
     || [ ! -f "$meta" ] || [ -L "$meta" ] \
     || [ "$(fm_verify_file_link_count "$meta")" != 1 ]; then
-    rm -f -- "$tmp"
-    return 1
+    rc=1
   fi
-  mv -f -- "$tmp" "$meta" || { rm -f -- "$tmp"; return 1; }
-  return 0
+  # Corroboration when the PR library is loaded: metadata that parsed as a
+  # canonical PR identity before must still parse as one after. A task with no
+  # pr= line never parsed, and is held to the faithful-copy check alone.
+  if [ "$rc" -eq 0 ] && declare -f fm_pr_metadata_identity_parse >/dev/null 2>&1; then
+    if fm_pr_metadata_identity_parse "$meta" \
+      && ! fm_pr_metadata_identity_parse "$FM_VERIFY_META_TMP"; then
+      rc=1
+    fi
+  fi
+  if [ "$rc" -eq 0 ]; then
+    mv -f -- "$FM_VERIFY_META_TMP" "$meta" || rc=1
+  fi
+  fm_verify_meta_tmp_cleanup
+  fm_verify_meta_trap_disarm
+  return "$rc"
 }
 
 # fm_verify_record_override <ledger> <meta> <sha> <reason> <path>: the durable

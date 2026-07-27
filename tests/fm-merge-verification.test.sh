@@ -28,7 +28,9 @@
 #   (m) fm-verify.sh refuses to record evidence for a dirty worktree
 #   (n) the PR head is the anchor, and a head the forge cannot report refuses
 #   (o) a returned worktree does not turn the honest path into an override
-#   (p) the override's metadata note leaves the task's PR metadata parseable
+#   (p) the override's metadata note leaves the task's PR metadata parseable,
+#       and an override whose record cannot be written is refused rather than
+#       taken on a half-written file
 #   (q) a declared step set that exists but is unusable refuses, and never
 #       reads as "this project declares nothing"
 #   (r) a declared step that reads stdin cannot swallow the steps after it
@@ -515,6 +517,12 @@ test_override_note_keeps_pr_metadata_parseable() {
   reason="GitHub Actions minutes exhausted; checks cannot run at all this cycle"
   case_dir=$(make_case override-meta-parse no-mistakes)
 
+  # The first, refused run is what records pr= and pr_head=, so this snapshot is
+  # the exact metadata the override then has to preserve.
+  run "$case_dir" merge "$PR_MERGE" task-x1 "$PR_URL"
+  expect_code 4 "$RC" "override-meta-parse: the unverified PR should refuse first"
+  cp "$case_dir/state/task-x1.meta" "$case_dir/meta.before"
+
   set +e
   FM_MERGE_OVERRIDE_ACK=$ACK fm "$case_dir" "$PR_MERGE" task-x1 "$PR_URL" \
     --override-unverified "$reason" > "$case_dir/ovr.out" 2> "$case_dir/ovr.err"
@@ -523,6 +531,14 @@ test_override_note_keeps_pr_metadata_parseable() {
   expect_code 0 "$RC" "override-meta-parse: a complete override should merge the PR"
   assert_grep "merged_unverified=" "$case_dir/state/task-x1.meta" \
     "override-meta-parse: the override left no note in the task metadata"
+
+  # Nothing but the note changed. A rewrite that lost or reordered a line would
+  # pass a "the note is present" check and still break every later reader.
+  [ "$(grep -c '^merged_unverified=' "$case_dir/state/task-x1.meta")" = 1 ] \
+    || fail "override-meta-parse: the rewrite did not add exactly one note line"
+  grep -v '^merged_unverified=' "$case_dir/state/task-x1.meta" > "$case_dir/meta.stripped"
+  cmp -s "$case_dir/meta.before" "$case_dir/meta.stripped" \
+    || fail "override-meta-parse: the rewrite did not preserve the metadata it was adding to"
 
   # The note must sit BEFORE pr=, because everything after pr= is treated as
   # post-recording injection by every later reader of this file.
@@ -543,6 +559,35 @@ test_override_note_keeps_pr_metadata_parseable() {
   [ -z "$(find "$case_dir/state" -name '.fm-verify-meta.*' -print -quit)" ] \
     || fail "override-meta-parse: the rewrite left its temporary file behind"
   pass "the override's metadata note leaves the task's PR metadata and armed poll intact"
+}
+
+# --- (p2) an override whose record cannot be written is not taken -----------
+
+test_override_refuses_when_metadata_cannot_be_rewritten() {
+  local case_dir before reason
+  reason="GitHub Actions minutes exhausted; checks cannot run at all this cycle"
+  case_dir=$(make_case override-meta-unwritable local-only)
+  before=$(main_of "$case_dir")
+  # A second hard link means the rewrite cannot be proven to land on the file
+  # firstmate read, so the copy is refused rather than written blind.
+  ln "$case_dir/state/task-x1.meta" "$case_dir/state/extra-link"
+
+  set +e
+  FM_MERGE_OVERRIDE_ACK=$ACK fm "$case_dir" "$MERGE_LOCAL" task-x1 \
+    --override-unverified "$reason" > "$case_dir/ovr.out" 2> "$case_dir/ovr.err"
+  RC=$?
+  set -e
+
+  expect_code 4 "$RC" "override-meta-unwritable: an unrecordable override must not be taken"
+  assert_grep 'could not be recorded' "$case_dir/ovr.err" \
+    "override-meta-unwritable: the refusal did not say the override went unrecorded"
+  assert_not_merged_local "$case_dir" "$before" \
+    "override-meta-unwritable: local main moved on an override that was never recorded"
+  assert_no_grep 'merged_unverified=' "$case_dir/state/task-x1.meta" \
+    "override-meta-unwritable: a refused rewrite still altered the task metadata"
+  [ -z "$(find "$case_dir/state" -name '.fm-verify-meta.*' -print -quit)" ] \
+    || fail "override-meta-unwritable: the refused rewrite left its temporary file behind"
+  pass "an override whose metadata record cannot be written is refused, not taken"
 }
 
 # --- (q) a declaration that exists but is unusable is not "no declaration" --
@@ -613,5 +658,6 @@ test_verify_refuses_dirty_worktree
 test_pr_refuses_unknown_head
 test_pr_resolves_head_after_worktree_returned
 test_override_note_keeps_pr_metadata_parseable
+test_override_refuses_when_metadata_cannot_be_rewritten
 test_unusable_declaration_refuses
 test_declared_step_cannot_eat_the_step_list
