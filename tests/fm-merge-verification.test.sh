@@ -28,9 +28,10 @@
 #   (m) fm-verify.sh refuses to record evidence for a dirty worktree
 #   (n) the PR head is the anchor, and a head the forge cannot report refuses
 #   (o) a returned worktree does not turn the honest path into an override
-#   (p) the override's metadata note leaves the task's PR metadata parseable,
-#       and an override whose record cannot be written is refused rather than
-#       taken on a half-written file
+#   (p) the override's metadata note leaves the task's PR metadata parseable;
+#       an override whose record cannot be written is refused rather than taken
+#       on a half-written file; and a repeat override or a backslash in the
+#       reason is recorded rather than spuriously refused
 #   (q) a declared step set that exists but is unusable refuses, and never
 #       reads as "this project declares nothing"
 #   (r) a declared step that reads stdin cannot swallow the steps after it
@@ -590,6 +591,60 @@ test_override_refuses_when_metadata_cannot_be_rewritten() {
   pass "an override whose metadata record cannot be written is refused, not taken"
 }
 
+# --- (p3) the override stays usable on a task that already took one ---------
+
+test_repeated_identical_override_still_records() {
+  local case_dir reason attempt
+  reason="GitHub Actions minutes exhausted; checks cannot run at all this cycle"
+  case_dir=$(make_case override-repeated no-mistakes)
+
+  # The same commit and the same reason produce a byte-identical note line, so
+  # the second override is the case where "exactly one note" and "one MORE note
+  # than before" diverge. A merge that fails after the note is recorded and is
+  # then retried lands here, and the escape hatch has to keep working.
+  for attempt in first second; do
+    set +e
+    FM_MERGE_OVERRIDE_ACK=$ACK fm "$case_dir" "$PR_MERGE" task-x1 "$PR_URL" \
+      --override-unverified "$reason" > "$case_dir/ovr-$attempt.out" 2> "$case_dir/ovr-$attempt.err"
+    RC=$?
+    set -e
+    expect_code 0 "$RC" "override-repeated: the $attempt override should merge, not refuse as unrecordable"
+  done
+
+  [ "$(grep -c 'pr merge 9 --repo example/repo' "$case_dir/gh-axi.log")" = 2 ] \
+    || fail "override-repeated: the forge did not merge on both overrides"
+  [ "$(grep -c '^merged_unverified=' "$case_dir/state/task-x1.meta")" = 2 ] \
+    || fail "override-repeated: the second identical override was not recorded in the metadata"
+  [ "$(grep -c '^override' "$case_dir/state/task-x1.verification")" = 2 ] \
+    || fail "override-repeated: the second identical override was not recorded in the ledger"
+  fm_pr_metadata_identity_parse "$case_dir/state/task-x1.meta" \
+    || fail "override-repeated: two override notes made the task metadata unparseable"
+  pass "a second override with an identical commit and reason is still recorded and still merges"
+}
+
+# --- (p4) an override reason is free text, including backslashes ------------
+
+test_override_reason_with_backslash_records() {
+  local case_dir reason
+  reason='the build agent is wedged on C:\builds\fm and cannot be restarted'
+  case_dir=$(make_case override-backslash local-only)
+
+  set +e
+  FM_MERGE_OVERRIDE_ACK=$ACK fm "$case_dir" "$MERGE_LOCAL" task-x1 \
+    --override-unverified "$reason" > "$case_dir/ovr.out" 2> "$case_dir/ovr.err"
+  RC=$?
+  set -e
+
+  expect_code 0 "$RC" "override-backslash: a reason with a backslash should merge, not refuse"
+  [ "$(main_of "$case_dir")" = "$(tip "$case_dir")" ] \
+    || fail "override-backslash: the override did not merge"
+  assert_grep "$reason" "$case_dir/state/task-x1.meta" \
+    "override-backslash: the reason was lost or mangled in the task metadata"
+  assert_grep "$reason" "$case_dir/state/task-x1.verification" \
+    "override-backslash: the reason was lost or mangled in the ledger"
+  pass "an override reason containing a backslash is recorded verbatim and still merges"
+}
+
 # --- (q) a declaration that exists but is unusable is not "no declaration" --
 
 test_unusable_declaration_refuses() {
@@ -659,5 +714,7 @@ test_pr_refuses_unknown_head
 test_pr_resolves_head_after_worktree_returned
 test_override_note_keeps_pr_metadata_parseable
 test_override_refuses_when_metadata_cannot_be_rewritten
+test_repeated_identical_override_still_records
+test_override_reason_with_backslash_records
 test_unusable_declaration_refuses
 test_declared_step_cannot_eat_the_step_list

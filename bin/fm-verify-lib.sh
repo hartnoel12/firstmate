@@ -432,19 +432,52 @@ fm_verify_meta_compose() {  # <meta> <tmp> <note>
   return 0
 }
 
-# fm_verify_meta_rewrite_faithful <meta> <tmp> <note>: 0 only when <tmp> is
-# <meta> with exactly one <note> line added and nothing else changed, moved, or
-# lost. Proving the note landed is not enough: the note is inserted immediately
-# before pr=, which bin/fm-pr-check.sh writes last, so a truncation right after
-# the note would leave the note present and the pr= identity gone.
-fm_verify_meta_rewrite_faithful() {  # <meta> <tmp> <note>
-  local meta=$1 tmp=$2 note=$3 added
-  added=$(awk -v note="$note" '$0 == note { n++ } END { print n + 0 }' "$tmp") || return 1
-  [ "$added" = 1 ] || return 1
-  awk -v note="$note" '
-    !dropped && $0 == note { dropped = 1; next }
-    { print }
-  ' "$tmp" 2>/dev/null | cmp -s - <(awk '{ print }' "$meta" 2>/dev/null)
+# The note is operator free text, so every comparison against it is a whole-line
+# shell string comparison. Nothing here interpolates it into a pattern language:
+# awk's -v applies escape processing, and a reason containing a backslash would
+# then fail to match the very line it was written from, refusing an override
+# that was recorded perfectly well.
+
+# fm_verify_meta_note_count <file> <note>: how many whole lines equal <note>.
+fm_verify_meta_note_count() {  # <file> <note>
+  local file=$1 note=$2 line n=0
+  if [ -f "$file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ "$line" = "$note" ]; then
+        n=$((n + 1))
+      fi
+    done < "$file"
+  fi
+  printf '%s' "$n"
+}
+
+# fm_verify_meta_lines <file> [skip-note]: echo <file> a line at a time, so a
+# missing final newline compares equal to a present one. With [skip-note], the
+# FIRST line equal to it is dropped.
+fm_verify_meta_lines() {  # <file> [skip-note]
+  local file=$1 skip=${2:-} line dropped=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$dropped" -eq 0 ] && [ -n "$skip" ] && [ "$line" = "$skip" ]; then
+      dropped=1
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$file"
+}
+
+# fm_verify_meta_rewrite_faithful <meta> <tmp> <note> <before>: 0 only when
+# <tmp> is <meta> with exactly one more <note> line than the <before> count and
+# nothing else changed, moved, or lost. Proving the note landed is not enough:
+# the note is inserted immediately before pr=, which bin/fm-pr-check.sh writes
+# last, so a truncation right after the note would leave the note present and
+# the pr= identity gone. The count is a DELTA rather than an absolute, because a
+# task taking a second override with the same commit and the same reason already
+# carries an identical note line and must still be able to record.
+fm_verify_meta_rewrite_faithful() {  # <meta> <tmp> <note> <before>
+  local meta=$1 tmp=$2 note=$3 before=$4 after
+  after=$(fm_verify_meta_note_count "$tmp" "$note") || return 1
+  [ "$after" -eq $((before + 1)) ] || return 1
+  fm_verify_meta_lines "$tmp" "$note" | cmp -s - <(fm_verify_meta_lines "$meta")
 }
 
 # fm_verify_meta_note_override <meta> <sha> <reason>: write one
@@ -453,7 +486,7 @@ fm_verify_meta_rewrite_faithful() {  # <meta> <tmp> <note>
 # replacement is proven complete, because an override that cannot be recorded
 # is an override that is not taken.
 fm_verify_meta_note_override() {  # <meta> <sha> <reason>
-  local meta=$1 sha=$2 reason=$3 dir device note rc=0
+  local meta=$1 sha=$2 reason=$3 dir device note before rc=0
   [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
   [ "$(fm_verify_file_link_count "$meta")" = 1 ] || return 1
   dir=$(dirname -- "$meta")
@@ -461,6 +494,7 @@ fm_verify_meta_note_override() {  # <meta> <sha> <reason>
   [ -n "$device" ] || return 1
   [ "$(fm_verify_file_device "$meta")" = "$device" ] || return 1
   note="merged_unverified=$sha|$(fm_verify_field_clean "$reason")"
+  before=$(fm_verify_meta_note_count "$meta" "$note") || return 1
 
   fm_verify_meta_trap_arm
   FM_VERIFY_META_TMP=$(mktemp "$dir/.fm-verify-meta.XXXXXX") || {
@@ -468,7 +502,7 @@ fm_verify_meta_note_override() {  # <meta> <sha> <reason>
     return 1
   }
   if ! fm_verify_meta_compose "$meta" "$FM_VERIFY_META_TMP" "$note" \
-    || ! fm_verify_meta_rewrite_faithful "$meta" "$FM_VERIFY_META_TMP" "$note" \
+    || ! fm_verify_meta_rewrite_faithful "$meta" "$FM_VERIFY_META_TMP" "$note" "$before" \
     || ! chmod 0600 "$FM_VERIFY_META_TMP" \
     || [ "$(fm_verify_file_device "$FM_VERIFY_META_TMP")" != "$device" ] \
     || [ ! -f "$meta" ] || [ -L "$meta" ] \

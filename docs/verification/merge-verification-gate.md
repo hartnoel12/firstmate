@@ -78,13 +78,18 @@ ok - PR merge refuses when the forge cannot report the head commit to bind evide
 ok - a returned worktree still resolves the PR head, so evidence is not lost to cleanup
 ok - the override's metadata note leaves the task's PR metadata and armed poll intact
 ok - an override whose metadata record cannot be written is refused, not taken
+ok - a second override with an identical commit and reason is still recorded and still merges
+ok - an override reason containing a backslash is recorded verbatim and still merges
 ok - a declared step set that exists but is unusable refuses instead of silently requiring nothing
 ok - a declared step that reads stdin cannot swallow the steps after it
 ```
 
-Four of those cases guard the gate's own record-keeping rather than a merge refusal, and each was watched failing against the pre-fix scripts before being encoded.
+Six of those cases guard the gate's own record-keeping rather than a merge refusal, and each was watched failing against the pre-fix scripts before being encoded.
 The override's metadata note is inserted before the `pr=` line, because `bin/fm-pr-lib.sh` treats everything after `pr=` as post-recording injection and an override reason is operator free text.
 That rewrite checks every write and then proves the replacement is the original plus exactly the note line before it replaces anything, so a filesystem that fills partway through refuses the override instead of installing a plausible-looking truncation, and its temporary copy of the metadata is removed on signal as well as on every return path.
+
+A guard that wrongly refuses is its own failure, because an override that will not record pushes the operator toward a worse workaround, so the proof is a delta rather than an absolute: the rewrite must add exactly one more note line than the metadata already carried, which keeps a repeat override of the same commit for the same reason recordable.
+Every comparison against the note is a whole-line shell string comparison, never a pattern, so a reason containing a backslash matches the line it was written from.
 A declared step set that exists but is unusable - a symlink, a directory - is refused rather than read as "this project declares nothing", which would silently drop the project from its own declared bar back to the floor.
 Declared steps are read into memory before any of them runs and each runs with stdin on `/dev/null`, so a step that drains stdin cannot consume the steps after it and leave a partial run recorded as a complete one.
 
