@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Behavior tests for bin/fm-brief.sh.
 #
-# Regression coverage for the heredoc-in-command-substitution parse bug (issue
-# #166): each ship-mode branch builds its Definition-of-done text with
-# `VAR=$(cat <<EOF ... EOF)`. Bash's lexer tracks quote state through the
-# heredoc body while it scans for the matching `)` of the command
-# substitution, so a single unescaped apostrophe anywhere in that body breaks
-# parsing of the *entire rest of the script* - `bash -n` fails, not just the
-# generated brief. A plain `cat > file <<EOF ... EOF` (not wrapped in `$(...)`)
-# is unaffected, so the secondmate charter block does not need this guard.
+# Regression coverage for the heredoc-in-command-substitution parse bug, which
+# shipped twice: issue #166, then again in #945 when a reworded line
+# reintroduced an apostrophe. Bash 3.2 - the system bash on macOS - tracks quote
+# state through a heredoc body while scanning for the matching `)` of a command
+# substitution, so one apostrophe in `VAR=$(cat <<EOF ... EOF)` breaks parsing
+# of the entire script. Bash 5 parses it fine, so the check below is only
+# meaningful under 3.2.
+#
+# The structural fix is that each Definition of done now lives in a function
+# body, where the heredoc is top level and apostrophes are simply safe. Wording
+# assertions no longer carry that safety; bin/fm-bash-syntax-check.sh and
+# tests/fm-bash-syntax-check.test.sh own it.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -18,15 +22,20 @@ TMP_ROOT=$(fm_test_tmproot fm-brief)
 BRIEF_HOME="$TMP_ROOT/home"
 mkdir -p "$BRIEF_HOME/data"
 
-# The script itself must always parse. This is the direct regression test for
-# issue #166: a stray apostrophe in any of the three DOD heredoc bodies
-# (no-mistakes/direct-PR/local-only) breaks `bash -n` on the whole file.
+# The script itself must always parse. Prefer /bin/bash when it is 3.2: that is
+# the parser the fleet runs and the only one that can see this bug. Checking
+# with whatever bash happened to be on PATH is what let #945 through CI.
 test_script_parses() {
-  local out rc
-  out=$(bash -n "$ROOT/bin/fm-brief.sh" 2>&1); rc=$?
-  expect_code 0 "$rc" "bash -n bin/fm-brief.sh must parse cleanly (got: $out)"
-  [ -z "$out" ] || fail "bash -n bin/fm-brief.sh emitted unexpected output: $out"
-  pass "fm-brief.sh: bash -n succeeds"
+  local out rc checker version
+  checker=bash
+  version=$(/bin/bash -c 'printf "%s" "$BASH_VERSION"' 2>/dev/null || printf 'none')
+  case "$version" in
+    3.2.*) checker=/bin/bash ;;
+  esac
+  out=$("$checker" -n "$ROOT/bin/fm-brief.sh" 2>&1); rc=$?
+  expect_code 0 "$rc" "$checker -n bin/fm-brief.sh must parse cleanly (got: $out)"
+  [ -z "$out" ] || fail "$checker -n bin/fm-brief.sh emitted unexpected output: $out"
+  pass "fm-brief.sh: bash -n succeeds ($checker)"
 }
 
 test_help_includes_entire_header() {
@@ -114,9 +123,14 @@ test_no_mistakes_dod_wording() {
   # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
   assert_grep '`help`' "$brief" \
     "no-mistakes DOD must render literal backticks around help"
-  assert_no_grep "no-mistakes' own guidance" "$brief" \
-    "no-mistakes DOD regressed to the apostrophe form that breaks bash -n"
-  pass "fm-brief.sh: no-mistakes DOD wording avoids the apostrophe regression"
+  # The line that broke the fleet in #945. It must now render with a real
+  # apostrophe and no backslash: escaping the apostrophe also silences bash -n,
+  # but leaks `firstmate\'s` into every crewmate brief.
+  assert_grep "bypass firstmate's authority check" "$brief" \
+    "no-mistakes DOD lost the possessive that must now be safe to write"
+  assert_no_grep "firstmate\\'s" "$brief" \
+    "no-mistakes DOD leaked a backslash: the apostrophe was escaped instead of structurally fixed"
+  pass "fm-brief.sh: no-mistakes DOD renders apostrophes literally"
 }
 
 test_ship_project_memory_wording() {

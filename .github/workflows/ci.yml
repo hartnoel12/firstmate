@@ -322,7 +322,12 @@ jobs:
           esac
           /bin/bash --version | head -1
           command -v jq >/dev/null || { echo "::error::jq is required"; exit 1; }
-          /bin/bash -n bin/fm-fleet-snapshot.sh
+          # Parse-check every canonical shell root under stock Bash 3.2. This is
+          # the only lane that can see the heredoc-in-command-substitution hazard;
+          # every other lane runs Bash 5, which parses it fine. --require-bash32
+          # makes the job fail rather than pass vacuously if this ever stops
+          # being Bash 3.2.
+          bin/fm-bash-syntax-check.sh --require-bash32
 
           snapshot_output=$(/bin/bash tests/fm-fleet-snapshot-view.test.sh)
           printf '%s\n' "$snapshot_output"
