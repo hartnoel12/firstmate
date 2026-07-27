@@ -21,8 +21,10 @@ LINT="$ROOT/bin/fm-lint.sh"
 CI="$ROOT/.github/workflows/ci.yml"
 NM="$ROOT/.no-mistakes.yaml"
 INSTALLER="$ROOT/bin/fm-install-shellcheck.sh"
-# The authoritative file set the one owner must run.
-CANON='ROOTS=(bin/*.sh bin/backends/*.sh tests/*.sh)'
+# The authoritative file set the one owner must run. It lives in a function so
+# bin/fm-bash-syntax-check.sh can consume it via --list-roots instead of
+# repeating the globs.
+CANON="printf '%s\\n' bin/*.sh bin/backends/*.sh tests/*.sh"
 # The pinned version, read from the single source (the one owner itself).
 REQUIRED=$("$LINT" --required-version)
 
@@ -41,6 +43,17 @@ test_owner_exists_and_executable() {
 
 test_owner_defines_canonical_set() {
   assert_grep "$CANON" "$LINT" "fm-lint.sh must run the canonical shellcheck file set"
+  [ "$(grep -Fc -- "$CANON" "$LINT")" -eq 1 ] \
+    || fail "the canonical file set must be spelled exactly once so consumers cannot drift"
+  # --list-roots must answer without ShellCheck installed: the Bash 3.2 parse
+  # sweep consumes it on a runner that never installs ShellCheck.
+  local roots
+  roots=$(PATH=/usr/bin:/bin "$LINT" --list-roots) \
+    || fail "fm-lint.sh --list-roots must work without ShellCheck on PATH"
+  printf '%s\n' "$roots" | grep -qx 'bin/fm-lint.sh' \
+    || fail "--list-roots must list bin/ scripts"
+  printf '%s\n' "$roots" | grep -qx 'tests/fm-lint.test.sh' \
+    || fail "--list-roots must list tests/ scripts"
   # It must not weaken CI: no severity downgrade and no blanket disable/exclude
   # that would hide findings CI fails on.
   assert_no_grep '--severity' "$LINT" "fm-lint.sh must not lower severity below the CI default"

@@ -22,6 +22,7 @@
 #   fm-lint.sh --jobs <1|2> [path]...  override bounded worker count
 #   fm-lint.sh --telemetry <path> ...  write a quiet metrics snapshot
 #   fm-lint.sh --required-version      print the ShellCheck pin
+#   fm-lint.sh --list-roots            print the canonical file set, one per line
 #   fm-lint.sh --help                  print this usage
 set -u
 
@@ -82,8 +83,22 @@ if [ "${1:-}" = "--required-version" ]; then
   exit 0
 fi
 
+# Canonical file set: the one authoritative definition. Callers never repeat
+# these globs, and every adapter and test shell remains an independent root.
+# bin/fm-bash-syntax-check.sh consumes it through --list-roots below, which is
+# answered before the ShellCheck probe so the parse sweep does not need
+# ShellCheck installed to learn which files are ours.
+fm_lint_canonical_roots() {
+  printf '%s\n' bin/*.sh bin/backends/*.sh tests/*.sh
+}
+
+if [ "${1:-}" = "--list-roots" ]; then
+  fm_lint_canonical_roots
+  exit 0
+fi
+
 fm_lint_usage() {
-  sed -n '2,25{s/^# \{0,1\}//;p;}' "$SELF"
+  sed -n '2,26{s/^# \{0,1\}//;p;}' "$SELF"
 }
 
 JOBS=${FM_LINT_JOBS:-2}
@@ -147,9 +162,11 @@ fi
 if [ "$#" -gt 0 ]; then
   ROOTS=("$@")
 else
-  # Canonical file set: the one authoritative definition. Callers never repeat
-  # these globs, and every adapter and test shell remains an independent root.
-  ROOTS=(bin/*.sh bin/backends/*.sh tests/*.sh)
+  ROOTS=()
+  while IFS= read -r canonical_root; do
+    [ -n "$canonical_root" ] || continue
+    ROOTS+=("$canonical_root")
+  done < <(fm_lint_canonical_roots)
 fi
 ROOT_COUNT=${#ROOTS[@]}
 

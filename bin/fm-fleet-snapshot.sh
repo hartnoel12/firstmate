@@ -770,21 +770,12 @@ else
   file_mode_octal() { stat -c '%a' "$1" 2>/dev/null || true; }
 fi
 
-registry_secondmates_json() {
-  local reg="$DATA/secondmates.md" out rc reason mode script parse_filter output_filter
-  if [ ! -f "$reg" ]; then
-    jq -n --arg path "$reg" --arg observed "$SNAPSHOT_NOW" \
-      '{present:false,available:true,complete:true,reason:null,provenance:"registered-table",path:$path,freshness:{status:"fresh",observed_at:$observed},records:[],input_truncated:false,records_truncated:false,reasons:[],lines_in_window:0,records_in_window:0}'
-    return 0
-  fi
-  mode=$(file_mode_octal "$reg")
-  if [ -z "$mode" ] || [ $((8#$mode & 0444)) -eq 0 ]; then
-    jq -n --arg path "$reg" --arg observed "$SNAPSHOT_NOW" \
-      --arg reason "registered secondmate table is unreadable" \
-      '{present:true,available:false,complete:false,reason:$reason,provenance:"registered-table",path:$path,freshness:{status:"unavailable",observed_at:$observed},records:[],input_truncated:false,records_truncated:false,reasons:[$reason],lines_in_window:0,records_in_window:0}'
-    return 0
-  fi
-  script=$(cat <<'BASH'
+# Heredoc bodies live in function bodies, never inline in `VAR=$(cat <<X)`:
+# bash 3.2 cannot parse a heredoc nested in a command substitution, so a single
+# apostrophe in an embedded script or jq filter would break this whole file.
+# See bin/fm-bash-syntax-check.sh.
+registry_reader_script() {
+  cat <<'BASH'
     f=$1
     max_lines=$2
     max_bytes=$3
@@ -833,8 +824,10 @@ registry_secondmates_json() {
       --argjson records_in_window "$records_in_window" \
       --argjson max_records "$max_records" "$output_filter"
 BASH
-  )
-  parse_filter=$(cat <<'JQ'
+}
+
+registry_parse_filter() {
+  cat <<'JQ'
       [ inputs
         | select(startswith("- "))
         | (capture("^- (?<id>[^[:space:]]+)")?) as $id
@@ -845,8 +838,10 @@ BASH
       | group_by(.id)
       | map(if length > 1 then .[0] + {registry_error:"duplicate secondmate id in registry"} else .[0] end)
 JQ
-  )
-  output_filter=$(cat <<'JQ'
+}
+
+registry_output_filter() {
+  cat <<'JQ'
       {present:true,available:true,reason:null,provenance:"registered-table",path:$path,
        freshness:{status:"fresh",observed_at:$observed},
        records:(if length > $max_records then .[:$max_records] else . end),
@@ -858,7 +853,25 @@ JQ
          (if $records_truncated then "record_limit" else empty end)
        ],lines_in_window:$lines_in_window,records_in_window:$records_in_window}
 JQ
-  )
+}
+
+registry_secondmates_json() {
+  local reg="$DATA/secondmates.md" out rc reason mode script parse_filter output_filter
+  if [ ! -f "$reg" ]; then
+    jq -n --arg path "$reg" --arg observed "$SNAPSHOT_NOW" \
+      '{present:false,available:true,complete:true,reason:null,provenance:"registered-table",path:$path,freshness:{status:"fresh",observed_at:$observed},records:[],input_truncated:false,records_truncated:false,reasons:[],lines_in_window:0,records_in_window:0}'
+    return 0
+  fi
+  mode=$(file_mode_octal "$reg")
+  if [ -z "$mode" ] || [ $((8#$mode & 0444)) -eq 0 ]; then
+    jq -n --arg path "$reg" --arg observed "$SNAPSHOT_NOW" \
+      --arg reason "registered secondmate table is unreadable" \
+      '{present:true,available:false,complete:false,reason:$reason,provenance:"registered-table",path:$path,freshness:{status:"unavailable",observed_at:$observed},records:[],input_truncated:false,records_truncated:false,reasons:[$reason],lines_in_window:0,records_in_window:0}'
+    return 0
+  fi
+  script=$(registry_reader_script)
+  parse_filter=$(registry_parse_filter)
+  output_filter=$(registry_output_filter)
   out=$(run_timed "$FM_SNAPSHOT_REGISTRY_TIMEOUT" bash -c "$script" \
     fm-secondmate-registry "$reg" "$FM_SNAPSHOT_REGISTRY_LINES" \
     "$FM_SNAPSHOT_REGISTRY_BYTES" "$FM_SNAPSHOT_REGISTRY_RECORDS" "$reg" "$SNAPSHOT_NOW" \
@@ -876,13 +889,8 @@ JQ
     '{present:true,available:false,complete:false,reason:$reason,provenance:"registered-table",path:$path,freshness:{status:"unavailable",observed_at:$observed},records:[],input_truncated:false,records_truncated:false,reasons:[$reason],lines_in_window:0,records_in_window:0}'
 }
 
-bounded_parent_activities_json() {  # <status-file>
-  local f=$1 out rc reason script
-  if [ ! -f "$f" ]; then
-    jq -n '{records:[],available:true,input_truncated:false,retained_truncated:false,reasons:[],lines_in_window:0,records_in_window:0}'
-    return 0
-  fi
-  script=$(cat <<'BASH'
+parent_activities_reader_script() {
+  cat <<'BASH'
     classify=$1
     f=$2
     max_lines=$3
@@ -945,7 +953,15 @@ bounded_parent_activities_json() {  # <status-file>
          lines_in_window:$lines_in_window,
          records_in_window:$records_in_window}'
 BASH
-  )
+}
+
+bounded_parent_activities_json() {  # <status-file>
+  local f=$1 out rc reason script
+  if [ ! -f "$f" ]; then
+    jq -n '{records:[],available:true,input_truncated:false,retained_truncated:false,reasons:[],lines_in_window:0,records_in_window:0}'
+    return 0
+  fi
+  script=$(parent_activities_reader_script)
   out=$(run_timed "$FM_SNAPSHOT_PARENT_ACTIVITY_TIMEOUT" bash -c "$script" \
     fm-parent-activities "$SCRIPT_DIR/fm-classify-lib.sh" "$f" \
     "$FM_SNAPSHOT_PARENT_ACTIVITY_LINES" "$FM_SNAPSHOT_PARENT_ACTIVITY_BYTES" \
