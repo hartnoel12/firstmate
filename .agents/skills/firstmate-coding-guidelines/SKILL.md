@@ -97,7 +97,8 @@ Run `bin/fm-doc-audience-check.sh`; it enforces classification, README setup rou
 - `bin/*.sh` and `bin/backends/*.sh` must pass `shellcheck`.
 - Never open a heredoc inside a command substitution (`VAR=$(cat <<EOF ... EOF)`).
 - Bash 3.2, the system bash on macOS, cannot parse that form once the body contains an apostrophe, so it breaks the whole script on a fleet machine while parsing fine under the Bash 5 that CI's Linux lanes run.
-- Put the heredoc in a function body and call it (`VAR=$(the_function)`); `bin/fm-bash-syntax-check.sh` owns the rule and the enforcement.
+- Put the heredoc in a function body and call it (`VAR=$(the_function)`); `bin/fm-bash-syntax-check.sh`'s header owns the rule and its full rationale.
+- Enforcement is split: `bin/fm-bash-syntax-check.sh` parse-checks every canonical root and only sees the hazard under a real Bash 3.2 (the macOS CI lane and local macOS runs), while `tests/fm-bash-syntax-check.test.sh` bans the idiom structurally across `bin/` on every lane, apostrophe or not.
 - Run `bin/fm-lint.sh` before treating a script change as done; it is the single owner of the lint definition (file set, config, and pinned shellcheck version) that CI and the no-mistakes pre-push gate both invoke, and it refuses to run under any other shellcheck version.
 - Colocate tests with the existing pattern in `tests/`, name them `<subject>.test.sh`, and extend an existing script rather than inventing a new runner.
 - A maintainer-verification record under `docs/verification/` records active empirical facts, not assumptions or task chronology.
