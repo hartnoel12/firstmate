@@ -137,6 +137,7 @@ With no declaration the gate still requires a passing run bound to the exact com
 This file is local to each Firstmate home and is not part of secondmate inherited configuration.
 It must be a regular file.
 A path that exists but cannot be read as a declaration, such as a symlink or a directory, is refused by both `bin/fm-verify.sh` and the merge gate rather than treated as "this project declares nothing", because reading it that way would silently drop the project from its declared bar back to the floor.
+See [`verification/merge-verification-gate.md`](verification/merge-verification-gate.md) for active evidence, including the measurement behind not consulting the no-mistakes run record.
 
 ## Gate defaults (.no-mistakes.yaml)
 
@@ -412,6 +413,7 @@ FM_SESSION_START_STATUS_TAIL=5   # state/*.status lines printed per task in the 
 FM_BOOTSTRAP_DETECT_ONLY=0   # internal/read-only session-start mode: skip bootstrap's mutating sweeps and print advisory TANGLE wording
 FM_GUARD_READ_ONLY=0    # internal/read-only guard mode: keep alarms but suppress drain, supervision repair, and checkout repair commands
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the guarded operation WILL still run.'   # banner continuation line; fm-send.sh overrides it to name the requested message specifically
+FM_MERGE_OVERRIDE_ACK=  # acknowledgement the merge entrypoints demand alongside --override-unverified before landing a commit with no verification evidence; bin/fm-verify-lib.sh owns the exact value and the rest of that contract
 FM_POLL=15              # seconds between watcher poll cycles
 FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartbeats are absorbed while idle
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap

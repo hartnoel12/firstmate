@@ -197,4 +197,5 @@ It refuses a GitLab merge request URL rather than sending it to the wrong forge,
 
 A GitLab task records no `pr_head=`.
 `gh` exposes the head commit as a selectable field, while plain `glab` exposes it only inside its JSON output, which would need a JSON processor firstmate does not require.
-Both consumers already treat it as optional: `bin/fm-teardown.sh` reads the head from the forge at teardown rather than from metadata and falls back to its provider-agnostic content check, and `bin/fm-review-diff.sh` resolves the head from the remote when none is recorded.
+Those consumers already treat it as optional: `bin/fm-teardown.sh` reads the head from the forge at teardown rather than from metadata and falls back to its provider-agnostic content check, and `bin/fm-review-diff.sh` resolves the head from the remote when none is recorded.
+The merge verification gate is the one consumer that must have a head - it binds evidence to the exact commit being merged and refuses without one - but it is reached only on the GitHub-only merge path above, so a GitLab task is unaffected ([`verification/merge-verification-gate.md`](verification/merge-verification-gate.md#scope-of-the-guarantee)).
