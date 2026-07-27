@@ -304,6 +304,12 @@ jobs:
           path: ${{ runner.temp }}/fm-test/fm-test-timing-aggregate.json
           if-no-files-found: warn
 
+  # Stock macOS Bash 3.2 lane, covering two things: a parse sweep of every
+  # canonical shell root via bin/fm-bash-syntax-check.sh --require-bash32, which
+  # is the only lane that can catch Bash 3.2 parse hazards because every other
+  # lane runs Bash 5, plus the snapshot and Bearings consumer tests the job is
+  # named for. The display name deliberately stays as-is despite being narrower
+  # than the coverage, because required-status-check configuration references it.
   macos-stock-bash:
     name: Stock macOS Bash snapshot compatibility
     runs-on: macos-latest
