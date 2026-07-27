@@ -102,6 +102,7 @@ while IFS= read -r path; do
   [ -n "$path" ] || continue
   if [ ! -f "$path" ]; then
     printf 'fm-bash-syntax-check.sh: missing root %s\n' "$path" >&2
+    checked=$((checked + 1))
     failed=$((failed + 1))
     continue
   fi

@@ -137,15 +137,95 @@ test_missing_interpreter_is_loud() {
 
 # Structural ban, checked on every CI lane rather than only the macOS one: the
 # idiom itself must stay out of bin/, so prose there can carry apostrophes.
+#
+# The rule is "never open a heredoc inside a command substitution", not "never
+# write `cat`". Matching only `=$(cat <<` would let `filter=$(sed -f - <<SED`,
+# `out=$(jq -n -f /dev/stdin <<JQ` and `"$(cat <<EOF"` through, and each is the
+# same hazard: it ships latent because an even number of apostrophes parses by
+# luck, then breaks the fleet when someone edits the prose. That is how #945 got
+# in. Factored into a function so the ban can be shown rejecting those forms
+# (test_structural_ban_rejects_the_broadened_forms) rather than merely asserted.
+heredoc_in_command_substitution_hits() {  # <file>...
+  # `$(` or a backtick, then a heredoc opener before the substitution closes.
+  # `[^()]*` keeps arithmetic `$(( x << y ))` out; `[^<]` on both sides keeps
+  # `<<<` herestrings out; requiring no `)` before the `<<` means a heredoc
+  # opened after the substitution already closed stays top level, and so does
+  # the safe reverse nesting - a `$( )` sitting inside a heredoc body.
+  # Comment lines are skipped: four bin/ scripts document the rule by quoting it.
+  # shellcheck disable=SC2016  # deliberate: this is a literal search pattern, not an expansion.
+  grep -nHE '\$\([^()]*[^<]<<[^<]|`[^`]*[^<]<<[^<]' "$@" 2>/dev/null \
+    | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true
+}
+
 test_bin_has_no_heredoc_in_command_substitution() {
   local hits
-  # Skip comment lines: the rule is documented with the idiom it forbids.
-  # shellcheck disable=SC2016  # deliberate: this is a literal search pattern, not an expansion.
-  hits=$(grep -rn '=\$(cat <<' "$ROOT"/bin/*.sh "$ROOT"/bin/backends/*.sh 2>/dev/null \
-    | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true)
+  hits=$(heredoc_in_command_substitution_hits "$ROOT"/bin/*.sh "$ROOT"/bin/backends/*.sh)
   [ -z "$hits" ] || fail "bin/ must not open a heredoc inside \$( ); put it in a function body:
 $hits"
   pass "bin/ opens no heredoc inside a command substitution"
+}
+
+# A ban you have not seen reject something is not a ban. Every fixture here is a
+# real heredoc-in-command-substitution that the old `=$(cat <<` spelling missed.
+test_structural_ban_rejects_the_broadened_forms() {
+  local dir name hits
+  dir="$TMP_ROOT/ban-fixtures"
+  mkdir -p "$dir"
+
+  cat > "$dir/sed.sh" <<'BAD'
+filter=$(sed -f - <<SED
+s/x/firstmate's y/
+SED
+)
+BAD
+  cat > "$dir/jq.sh" <<'BAD'
+out=$(jq -n -f /dev/stdin <<JQ
+{ note: "firstmate's authority" }
+JQ
+)
+BAD
+  cat > "$dir/nonassign.sh" <<'BAD'
+printf '%s' "$(cat <<EOF
+firstmate's authority check
+EOF
+)"
+BAD
+  cat > "$dir/dash.sh" <<'BAD'
+TEXT=$(cat <<-EOF
+	firstmate's authority check
+	EOF
+)
+BAD
+  cat > "$dir/backtick.sh" <<'BAD'
+TEXT=`cat <<EOF
+firstmate's authority check
+EOF
+`
+BAD
+
+  for name in sed jq nonassign dash backtick; do
+    hits=$(heredoc_in_command_substitution_hits "$dir/$name.sh")
+    [ -n "$hits" ] || fail "the structural ban must reject $name.sh: it opens a heredoc inside a command substitution"
+  done
+
+  # ...and must not fire on the forms that are genuinely safe, or bin/ could not
+  # keep using them: a herestring, an arithmetic left shift, a heredoc opened
+  # after the substitution closed, and a `$( )` inside a top-level heredoc body
+  # (bin/fm-brief.sh does exactly this at its `read -r MODE _ <<EOF` block).
+  cat > "$dir/safe.sh" <<'GOOD'
+val=$(tr a b <<<"$MODE")
+hb=$(( HEARTBEAT * (1 << streak) ))
+label=$(printf '%s' one) ; cat <<EOF
+firstmate's authority check
+EOF
+read -r MODE _ <<EOF
+$(printf '%s %s' ship now)
+EOF
+GOOD
+  hits=$(heredoc_in_command_substitution_hits "$dir/safe.sh")
+  [ -z "$hits" ] || fail "the structural ban must not flag safe forms:
+$hits"
+  pass "structural ban rejects non-cat, non-assignment and backtick forms while clearing safe ones"
 }
 
 test_ci_runs_the_guard_on_stock_bash() {
@@ -161,4 +241,5 @@ test_apostrophe_in_command_substitution_is_caught_under_bash32
 test_require_bash32_refuses_a_newer_bash
 test_missing_interpreter_is_loud
 test_bin_has_no_heredoc_in_command_substitution
+test_structural_ban_rejects_the_broadened_forms
 test_ci_runs_the_guard_on_stock_bash
