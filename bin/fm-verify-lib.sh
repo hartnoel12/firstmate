@@ -150,9 +150,23 @@ fm_verify_config_path() {
 # declared step. Blank lines and # comments are ignored; a line without '=' or
 # with an unusable step name is a configuration error, reported and refused, so
 # a typo silently lowers no bar.
+#
+# Absent is the one silent success: a project that declares nothing is a
+# legitimate case and leaves the gate at its floor. A declaration that EXISTS
+# but is unusable - a symlink, a directory, a device - is NOT the same thing as
+# no declaration, and must never be read as one: that would quietly drop a
+# project from its own declared bar back to the floor. It is reported and
+# refused, the way this library refuses a symlinked ledger.
 fm_verify_config_steps() {
   local file=$1 line name cmd
-  [ -n "$file" ] && [ -f "$file" ] && [ ! -L "$file" ] || return 0
+  [ -n "$file" ] || return 0
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    return 0
+  fi
+  if [ -L "$file" ] || [ ! -f "$file" ]; then
+    echo "error: $file: verification step declaration must be a regular file, not a symlink or special file" >&2
+    return 1
+  fi
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       ''|'#'*|[[:space:]]*'#'*) continue ;;
@@ -337,6 +351,74 @@ EOF
   printf '%s\n' "$banner" >&2
 }
 
+# --- the override's copy in task metadata -----------------------------------
+#
+# bin/fm-pr-lib.sh parses a task's .meta under a strict rule: after the pr= line
+# nothing but pr_head= and a short x_* allowlist may appear, because everything
+# else there is treated as post-recording injection. An override reason is
+# operator free text - precisely what that guard exists to reject - so appending
+# the note would invalidate the metadata for every later reader of it (the armed
+# poll's retirement receipt, the check migration's canonicality test). The note
+# is therefore INSERTED BEFORE the first pr= line, through the same
+# temp-file-then-mv rewrite bin/fm-pr-check.sh uses, preserving 0600, the single
+# link, and the containing device. The ledger stays the primary trail; this copy
+# must never cost the metadata it rides along in.
+
+fm_verify_file_device() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %d "$1" 2>/dev/null
+  else
+    stat -c %d "$1" 2>/dev/null
+  fi
+}
+
+fm_verify_file_link_count() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %l "$1" 2>/dev/null
+  else
+    stat -c %h "$1" 2>/dev/null
+  fi
+}
+
+# fm_verify_meta_note_override <meta> <sha> <reason>: write one
+# merged_unverified=<sha>|<reason> line into <meta>, before its first pr= line
+# or at the end when it has none.
+fm_verify_meta_note_override() {  # <meta> <sha> <reason>
+  local meta=$1 sha=$2 reason=$3 dir device tmp note line inserted=0
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  [ "$(fm_verify_file_link_count "$meta")" = 1 ] || return 1
+  dir=$(dirname -- "$meta")
+  device=$(fm_verify_file_device "$dir") || return 1
+  [ -n "$device" ] || return 1
+  [ "$(fm_verify_file_device "$meta")" = "$device" ] || return 1
+  note="merged_unverified=$sha|$(fm_verify_field_clean "$reason")"
+  tmp=$(mktemp "$dir/.fm-verify-meta.XXXXXX") || return 1
+  if ! {
+      while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$inserted" -eq 0 ]; then
+          case "$line" in
+            pr=*) printf '%s\n' "$note" && inserted=1 ;;
+          esac
+        fi
+        printf '%s\n' "$line"
+      done < "$meta"
+      [ "$inserted" -eq 1 ] || printf '%s\n' "$note"
+    } > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! chmod 0600 "$tmp" \
+    || ! grep -qxF -- "$note" "$tmp" \
+    || [ "$(fm_verify_file_device "$tmp")" != "$device" ] \
+    || [ ! -f "$meta" ] || [ -L "$meta" ] \
+    || [ "$(fm_verify_file_link_count "$meta")" != 1 ]; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -f -- "$tmp" "$meta" || { rm -f -- "$tmp"; return 1; }
+  return 0
+}
+
 # fm_verify_record_override <ledger> <meta> <sha> <reason> <path>: the durable
 # half. Writes the override to the ledger AND to task metadata, so the trail
 # survives losing either one. Fails the merge if it cannot record - an
@@ -345,8 +427,11 @@ fm_verify_record_override() {  # <ledger> <meta> <sha> <reason> <path>
   local ledger=$1 meta=$2 sha=$3 reason=$4 path=$5 by
   by=${USER:-${LOGNAME:-unknown}}
   fm_verify_append "$ledger" override "$sha" "$path" "$reason" "$by" || return 1
-  if [ -f "$meta" ] && [ ! -L "$meta" ]; then
-    printf 'merged_unverified=%s|%s\n' "$sha" "$(fm_verify_field_clean "$reason")" >> "$meta" || return 1
+  # A task with no metadata at all still gets its ledger record. Metadata that
+  # exists but cannot be rewritten safely refuses, rather than losing the copy
+  # silently.
+  if [ -e "$meta" ] || [ -L "$meta" ]; then
+    fm_verify_meta_note_override "$meta" "$sha" "$reason" || return 1
   fi
   return 0
 }

@@ -26,15 +26,22 @@
 #   (l) the override merges, announces loudly, and records durably in both the
 #       ledger and the task metadata
 #   (m) fm-verify.sh refuses to record evidence for a dirty worktree
-#   (n) fm-verify.sh records the real exit code and never a claim
+#   (n) the PR head is the anchor, and a head the forge cannot report refuses
 #   (o) a returned worktree does not turn the honest path into an override
+#   (p) the override's metadata note leaves the task's PR metadata parseable
+#   (q) a declared step set that exists but is unusable refuses, and never
+#       reads as "this project declares nothing"
+#   (r) a declared step that reads stdin cannot swallow the steps after it
 set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-pr-lib.sh
+. "$ROOT/bin/fm-pr-lib.sh"
 fm_git_identity fmtest fmtest@example.invalid
 
 VERIFY="$ROOT/bin/fm-verify.sh"
+POLL="$ROOT/bin/fm-pr-poll.sh"
 MERGE_LOCAL="$ROOT/bin/fm-merge-local.sh"
 PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
 TMP_ROOT=$(fm_test_tmproot fm-merge-verification-tests)
@@ -501,6 +508,94 @@ test_pr_resolves_head_after_worktree_returned() {
   pass "a returned worktree still resolves the PR head, so evidence is not lost to cleanup"
 }
 
+# --- (p) the override's own record must not cost the task its metadata ------
+
+test_override_note_keeps_pr_metadata_parseable() {
+  local case_dir reason
+  reason="GitHub Actions minutes exhausted; checks cannot run at all this cycle"
+  case_dir=$(make_case override-meta-parse no-mistakes)
+
+  set +e
+  FM_MERGE_OVERRIDE_ACK=$ACK fm "$case_dir" "$PR_MERGE" task-x1 "$PR_URL" \
+    --override-unverified "$reason" > "$case_dir/ovr.out" 2> "$case_dir/ovr.err"
+  RC=$?
+  set -e
+  expect_code 0 "$RC" "override-meta-parse: a complete override should merge the PR"
+  assert_grep "merged_unverified=" "$case_dir/state/task-x1.meta" \
+    "override-meta-parse: the override left no note in the task metadata"
+
+  # The note must sit BEFORE pr=, because everything after pr= is treated as
+  # post-recording injection by every later reader of this file.
+  assert_grep "pr=$PR_URL" "$case_dir/state/task-x1.meta" \
+    "override-meta-parse: the override lost the recorded PR"
+  fm_pr_metadata_identity_parse "$case_dir/state/task-x1.meta" \
+    || fail "override-meta-parse: the override note made the task metadata unparseable"
+  [ "$FM_PR_META_URL" = "$PR_URL" ] \
+    || fail "override-meta-parse: the metadata no longer resolves to the recorded PR"
+  fm_pr_poll_artifacts_valid "$case_dir/state" task-x1 "$POLL" \
+    || fail "override-meta-parse: the override invalidated the armed PR poll"
+
+  # 0600 and a single link survive the rewrite.
+  [ "$(fm_pr_file_mode "$case_dir/state/task-x1.meta")" = 600 ] \
+    || fail "override-meta-parse: the metadata rewrite did not stay private"
+  [ "$(fm_pr_file_link_count "$case_dir/state/task-x1.meta")" = 1 ] \
+    || fail "override-meta-parse: the metadata rewrite left more than one link"
+  [ -z "$(find "$case_dir/state" -name '.fm-verify-meta.*' -print -quit)" ] \
+    || fail "override-meta-parse: the rewrite left its temporary file behind"
+  pass "the override's metadata note leaves the task's PR metadata and armed poll intact"
+}
+
+# --- (q) a declaration that exists but is unusable is not "no declaration" --
+
+test_unusable_declaration_refuses() {
+  local case_dir before
+  case_dir=$(make_case unusable-declaration local-only)
+  before=$(main_of "$case_dir")
+  mkdir -p "$case_dir/config/verify"
+  printf 'test = ./pass.sh\nlint = ./pass.sh\n' > "$case_dir/declared-elsewhere"
+  ln -s "$case_dir/declared-elsewhere" "$case_dir/config/verify/myproj"
+
+  run "$case_dir" verify "$VERIFY" run task-x1
+  expect_code 1 "$RC" "unusable-declaration: fm-verify.sh should refuse a symlinked declaration"
+  assert_grep 'must be a regular file' "$case_dir/verify.err" \
+    "unusable-declaration: refusal did not name the unusable declaration"
+  assert_no_grep 'no verification steps declared' "$case_dir/verify.err" \
+    "unusable-declaration: a symlinked declaration was read as no declaration at all"
+
+  # The merge must refuse too, rather than quietly requiring nothing: a single
+  # ad-hoc step would otherwise satisfy a project that declared two.
+  verify_pass "$case_dir"
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  [ "$RC" -ne 0 ] || fail "unusable-declaration: merge proceeded on an unreadable declared step set"
+  assert_grep 'must be a regular file' "$case_dir/merge.err" \
+    "unusable-declaration: the merge refusal did not name the unusable declaration"
+  assert_not_merged_local "$case_dir" "$before" \
+    "unusable-declaration: local main moved with the project's declared bar unread"
+  pass "a declared step set that exists but is unusable refuses instead of silently requiring nothing"
+}
+
+# --- (r) a step command cannot consume the step list ------------------------
+
+test_declared_step_cannot_eat_the_step_list() {
+  local case_dir
+  case_dir=$(make_case stdin-draining-step local-only)
+  mkdir -p "$case_dir/config/verify"
+  # `cat` drains whatever stdin it is handed. If the step list were still on
+  # stdin, it would swallow the remaining steps and they would never run.
+  printf 'drain = cat > /dev/null\ntest = ./pass.sh\n' > "$case_dir/config/verify/myproj"
+
+  run "$case_dir" verify "$VERIFY" run task-x1
+  expect_code 0 "$RC" "stdin-draining-step: the declared steps should pass"
+  assert_grep 'drain:passed,test:passed' "$case_dir/state/task-x1.verification" \
+    "stdin-draining-step: a step that reads stdin swallowed the steps after it"
+
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  expect_code 0 "$RC" "stdin-draining-step: the fully verified commit should merge"
+  [ "$(main_of "$case_dir")" = "$(tip "$case_dir")" ] \
+    || fail "stdin-draining-step: the verified commit did not land"
+  pass "a declared step that reads stdin cannot swallow the steps after it"
+}
+
 test_local_refuses_without_any_record
 test_pr_refuses_without_any_record
 test_local_refuses_stale_record
@@ -517,3 +612,6 @@ test_override_is_loud_and_durable
 test_verify_refuses_dirty_worktree
 test_pr_refuses_unknown_head
 test_pr_resolves_head_after_worktree_returned
+test_override_note_keeps_pr_metadata_parseable
+test_unusable_declaration_refuses
+test_declared_step_cannot_eat_the_step_list

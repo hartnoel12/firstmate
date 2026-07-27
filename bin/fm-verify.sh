@@ -218,7 +218,10 @@ if [ "${#CMD[@]}" -gt 0 ]; then
   fi
 else
   CONFIG_FILE=$(fm_verify_config_path "$CONFIG" "$PROJECT")
-  if [ -z "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
+  # An unusable declaration (a symlink, a directory) is refused by
+  # fm_verify_config_steps below rather than mistaken for "declares nothing", so
+  # only a genuinely absent file reaches this message.
+  if [ -z "$CONFIG_FILE" ] || { [ ! -e "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ]; }; then
     die "no verification steps declared for this project.
 Declare them in ${CONFIG_FILE:-$CONFIG/verify/<project>} as '<step> = <command>' lines,
 or record one ad-hoc step:
@@ -226,17 +229,33 @@ or record one ad-hoc step:
   fi
   STEPS_TSV=$(fm_verify_config_steps "$CONFIG_FILE") || exit 1
   [ -n "$STEPS_TSV" ] || die "$CONFIG_FILE declares no steps"
-  # Declared steps are shell command lines written by the operator into a
-  # firstmate-private config file, so they run through the shell deliberately.
+  # The whole step list is read into memory BEFORE anything runs, so no step
+  # command can consume the list it is being read from and silently skip the
+  # steps after it - a partial run must never be recordable as a complete one.
+  STEP_NAMES=()
+  STEP_CMDS=()
   while IFS=$'\t' read -r name cmd; do
     [ -n "$name" ] || continue
+    STEP_NAMES+=("$name")
+    STEP_CMDS+=("$cmd")
+  done <<< "$STEPS_TSV"
+  [ "${#STEP_NAMES[@]}" -gt 0 ] || die "$CONFIG_FILE declares no steps"
+  # Declared steps are shell command lines written by the operator into a
+  # firstmate-private config file, so they run through the shell deliberately.
+  # Each runs with stdin on /dev/null: a step that reads stdin must neither eat
+  # anything of firstmate's nor block waiting for a terminal that is not there.
+  i=0
+  while [ "$i" -lt "${#STEP_NAMES[@]}" ]; do
+    name=${STEP_NAMES[$i]}
+    cmd=${STEP_CMDS[$i]}
+    i=$((i + 1))
     printf '== %s: %s\n' "$name" "$cmd"
-    if ( cd "$WT" && eval "$cmd" ); then
+    if ( cd "$WT" && eval "$cmd" ) </dev/null; then
       record_step "$name" passed
     else
       record_step "$name" failed
     fi
-  done <<< "$STEPS_TSV"
+  done
 fi
 
 [ -n "$RESULTS" ] || die "no verification step ran"

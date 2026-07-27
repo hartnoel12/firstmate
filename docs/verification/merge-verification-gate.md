@@ -75,7 +75,16 @@ ok - the override refuses without its acknowledgement or with a thin reason
 ok - the override merges, announces loudly on both streams, and records durably
 ok - fm-verify.sh refuses to record evidence for a dirty worktree
 ok - PR merge refuses when the forge cannot report the head commit to bind evidence to
+ok - a returned worktree still resolves the PR head, so evidence is not lost to cleanup
+ok - the override's metadata note leaves the task's PR metadata and armed poll intact
+ok - a declared step set that exists but is unusable refuses instead of silently requiring nothing
+ok - a declared step that reads stdin cannot swallow the steps after it
 ```
+
+Three of those cases guard the gate's own record-keeping rather than a merge refusal, and each was watched failing against the pre-fix scripts before being encoded.
+The override's metadata note is inserted before the `pr=` line, because `bin/fm-pr-lib.sh` treats everything after `pr=` as post-recording injection and an override reason is operator free text.
+A declared step set that exists but is unusable - a symlink, a directory - is refused rather than read as "this project declares nothing", which would silently drop the project from its own declared bar back to the floor.
+Declared steps are read into memory before any of them runs and each runs with stdin on `/dev/null`, so a step that drains stdin cannot consume the steps after it and leave a partial run recorded as a complete one.
 
 ## Scope of the guarantee
 

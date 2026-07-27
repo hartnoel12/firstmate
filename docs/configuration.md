@@ -135,6 +135,8 @@ Declaring steps raises that project's bar in two places at once.
 With no declaration the gate still requires a passing run bound to the exact commit, which is the floor rather than the ceiling.
 
 This file is local to each Firstmate home and is not part of secondmate inherited configuration.
+It must be a regular file.
+A path that exists but cannot be read as a declaration, such as a symlink or a directory, is refused by both `bin/fm-verify.sh` and the merge gate rather than treated as "this project declares nothing", because reading it that way would silently drop the project from its declared bar back to the floor.
 
 ## Gate defaults (.no-mistakes.yaml)
 
