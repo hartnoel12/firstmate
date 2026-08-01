@@ -41,6 +41,8 @@
 #   (q2) pushed to a fork, no local remote-tracking ref, open PR head
 #        matches HEAD exactly                                  -> ALLOW
 #   (q3) same, but one local commit sits past the PR head      -> REFUSE
+#   (q4) PR head absent locally, held only by the PR's own repo -> ALLOW  (fetch)
+#   (q5) PR head absent locally, PR repo unreachable, origin has it -> ALLOW
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
@@ -256,6 +258,34 @@ commit_tree_from_wt_head() {
   local case_dir=$1 parent=$2 msg=$3 tree
   tree=$(git -C "$case_dir/wt" rev-parse "$parent^{tree}") || return 1
   printf '%s\n' "$msg" | git -C "$case_dir/wt" commit-tree "$tree" -p "$parent"
+}
+
+# Build a PR head that CONTAINS this worktree's HEAD and lives ONLY in <repo>,
+# under refs/pull/7/head. The commit is made in a throwaway clone, so the object
+# is genuinely absent from the worktree's object database and ensure_commit_object
+# has to fetch it instead of answering from `git cat-file -e`. Echoes the PR head.
+# Args: case_dir bare_repo
+add_remote_only_pr_head() {
+  local case_dir=$1 repo=$2 side head
+  side="$case_dir/_prside"
+  git clone -q --branch fm/task-x1 "$case_dir/project" "$side"
+  git -C "$side" -c user.email=t@t -c user.name=t \
+    commit -q --allow-empty -m "commit made on the PR side"
+  head=$(git -C "$side" rev-parse HEAD)
+  git -C "$side" push -q "$repo" "HEAD:refs/pull/7/head"
+  rm -rf "$side"
+  ! git -C "$case_dir/wt" cat-file -e "$head^{commit}" 2>/dev/null \
+    || fail "fixture: the PR head is already a local object, so no fetch is exercised"
+  printf '%s\n' "$head"
+}
+
+# Send the https://github.com URL that fm-teardown derives from the recorded pr=
+# somewhere a test can actually reach. Point it at a bare repo to stand in for the
+# PR's own repository, or at a path that does not exist to make that leg fail so
+# the origin fallback is what answers. Args: case_dir path
+point_pr_repository_at() {
+  local case_dir=$1 path=$2
+  git -C "$case_dir/wt" config "url.$path.insteadOf" https://github.com/example/repo.git
 }
 
 land_equivalent_patch_on_origin_branch() {
@@ -1461,9 +1491,61 @@ test_local_commit_beyond_the_pr_head_still_refuses() {
   pass "a local commit past the PR head is still refused (safety preserved)"
 }
 
+# The PR head is genuinely NOT a local object, so ensure_commit_object must fetch
+# refs/pull/7/head before anything can be decided about it - and it must ask the
+# PR's OWN repository, because that is the only place holding the head here.
+# Origin deliberately does not have it: a fork workflow leaves origin pointing
+# somewhere the PR does not live.
+test_pr_head_fetched_from_the_prs_own_repository_allows() {
+  local case_dir rc head
+  case_dir=$(make_case pr-head-own-repo)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  append_pr_meta_url "$case_dir"
+  git init -q --bare "$case_dir/prrepo.git"
+  head=$(add_remote_only_pr_head "$case_dir" "$case_dir/prrepo.git")
+  point_pr_repository_at "$case_dir" "$case_dir/prrepo.git"
+  add_gh_pr_state_for_head "$case_dir" OPEN "$head"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "pr-head-own-repo: a PR head only the PR's repository holds must still resolve"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "pr-head-own-repo: teardown refused work the PR head contains"
+  pass "a PR head absent locally is fetched from the PR's own repository"
+}
+
+# The same shape with the legs swapped: the PR's own repository is unreachable and
+# only origin holds refs/pull/7/head, so the fallback is what has to answer.
+test_pr_head_fetched_from_origin_when_pr_repository_unreachable_allows() {
+  local case_dir rc head
+  case_dir=$(make_case pr-head-origin-fallback)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  append_pr_meta_url "$case_dir"
+  head=$(add_remote_only_pr_head "$case_dir" "$case_dir/origin.git")
+  point_pr_repository_at "$case_dir" "$case_dir/no-such-repo.git"
+  add_gh_pr_state_for_head "$case_dir" OPEN "$head"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "pr-head-origin-fallback: origin must still be tried when the PR repository fails"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "pr-head-origin-fallback: teardown refused work origin's PR head contains"
+  pass "a PR head absent locally falls back to origin when the PR's repository cannot be reached"
+}
+
 test_local_only_fork_remote_allows
 test_pushed_to_fork_without_tracking_ref_allows
 test_local_commit_beyond_the_pr_head_still_refuses
+test_pr_head_fetched_from_the_prs_own_repository_allows
+test_pr_head_fetched_from_origin_when_pr_repository_unreachable_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses

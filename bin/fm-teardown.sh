@@ -138,9 +138,6 @@ if [ "$BACKEND" = orca ]; then
 fi
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
-# The PR pr_state_and_head last answered for, so its callers fetch from that PR
-# rather than re-deriving the target.
-TEARDOWN_PR_TARGET=
 # tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
 # (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
@@ -390,10 +387,12 @@ $unpushed
 EOF
 }
 
-# Ask the forge for this worktree's PR state and head, as "<state>\t<head>", and
-# leave the PR it answered for in TEARDOWN_PR_TARGET. Resolves the PR from the
-# recorded pr= URL first, then from the branch name. Non-zero on no PR or any gh
-# error, so every caller treats an unanswerable forge as "cannot establish".
+# Ask the forge for this worktree's PR state and head, as
+# "<state>\t<head>\t<target>". The target rides back in the same record because a
+# command substitution runs in a subshell, so a global assigned here would never
+# reach the caller. Resolves the PR from the recorded pr= URL first, then from the
+# branch name. Non-zero on no PR or any gh error, so every caller treats an
+# unanswerable forge as "cannot establish".
 pr_state_and_head() {
   local branch=$1 target view
   if [ -n "$PR_URL" ]; then
@@ -404,8 +403,7 @@ pr_state_and_head() {
   [ -n "$target" ] || return 1
   view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
   [ "${view%%$'\t'*}" != "$view" ] || return 1
-  TEARDOWN_PR_TARGET=$target
-  printf '%s' "$view"
+  printf '%s\t%s' "$view" "$target"
 }
 
 # Is the worktree's PR merged for local work contained in that PR? Returns
@@ -413,16 +411,19 @@ pr_state_and_head() {
 # head, no PR is found, or any gh error occurs - the caller then falls back to
 # the content check.
 pr_is_merged() {
-  local branch=$1 view state head current
+  local branch=$1 view rest state head target current
   view=$(pr_state_and_head "$branch") || return 1
   state=${view%%$'\t'*}
-  head=${view#*$'\t'}
+  rest=${view#*$'\t'}
+  [ "${rest%%$'\t'*}" != "$rest" ] || return 1
+  head=${rest%%$'\t'*}
+  target=${rest#*$'\t'}
   case "$state" in
     MERGED|merged) ;;
     *) return 1 ;;
   esac
   [ -n "$head" ] || return 1
-  ensure_commit_object "$TEARDOWN_PR_TARGET" "$head" || return 1
+  ensure_commit_object "$target" "$head" || return 1
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
   git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
   unpushed_patches_are_in_pr_head "$head"
@@ -439,11 +440,14 @@ pr_is_merged() {
 # answer cannot be established, so an unreachable forge still refuses rather
 # than guesses; this only ever turns a false refusal into an allow.
 work_is_on_pr_head() {
-  local branch=$1 view head current
+  local branch=$1 view rest head target current
   view=$(pr_state_and_head "$branch") || return 1
-  head=${view#*$'\t'}
+  rest=${view#*$'\t'}
+  [ "${rest%%$'\t'*}" != "$rest" ] || return 1
+  head=${rest%%$'\t'*}
+  target=${rest#*$'\t'}
   [ -n "$head" ] || return 1
-  ensure_commit_object "$TEARDOWN_PR_TARGET" "$head" || return 1
+  ensure_commit_object "$target" "$head" || return 1
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
   git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null
 }

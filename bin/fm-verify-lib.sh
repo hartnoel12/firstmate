@@ -237,6 +237,10 @@ fm_verify_required_steps() {
 # The record separator, as a variable so the split below can quote it into a
 # pattern. Assigned once on source; harmless to reassign.
 FM_VERIFY_TAB=$(printf '\t')
+# The line separator, for walking records the gate accumulated itself. A command
+# substitution cannot produce it: it strips trailing newlines.
+FM_VERIFY_NL='
+'
 
 # fm_verify_record_split <line>: split one ledger line into exactly six fields,
 # leaving them in FM_VERIFY_REC_*. Returns non-zero for anything else.
@@ -289,8 +293,9 @@ FM_VERIFY_REFUSAL=''
 # merge output, so a passing gate still says what it actually checked.
 FM_VERIFY_EVIDENCE=''
 
-# fm_verify_csv_next <csv>: echo "<head>|<tail>" for a comma-separated list, so
-# the gate can walk one without building an array. An empty array expanded as
+# fm_verify_csv_head <csv> / fm_verify_csv_tail <csv>: echo the first element of
+# a comma-separated list, and everything after it, so the gate can walk one
+# without building an array. An empty array expanded as
 # "${a[@]}" is a fatal unbound-variable error under `set -u` on Bash 3.2, which
 # is the system Bash on the macOS half of this fleet, so the gate walks strings.
 fm_verify_csv_head() { printf '%s' "${1%%,*}"; }
@@ -311,7 +316,7 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
   local ledger=$1 sha=$2 required=${3:-} meta=${4:-}
   local line kind outcome steps what why value
   local found=0 rest pair name status req run_failed=0
-  local passed='' failed='' evidence='' first_failed_step=''
+  local passed='' evidence='' first_failed_step='' bypasses=''
 
   FM_VERIFY_REFUSAL=''
   FM_VERIFY_EVIDENCE=''
@@ -325,9 +330,12 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
     return 1
   fi
 
-  # One strict pass over the ledger. `|| [ -n "$line" ]` keeps the final record
-  # when the file lost its trailing newline: without it the LAST line is dropped
-  # silently, and the last line is exactly where a freshly recorded bypass is.
+  # One strict pass over the ledger, the only read of it. Bypass records are
+  # collected here and judged after the loop, once `passed` is complete, so no
+  # rule needs to open the file a second time. `|| [ -n "$line" ]` keeps the
+  # final record when the file lost its trailing newline: without it the LAST
+  # line is dropped silently, and the last line is exactly where a freshly
+  # recorded bypass is.
   while IFS= read -r line || [ -n "$line" ]; do
     # A blank line is not a record this file's writers can produce, so it is
     # damage, not noise: skipping it is how a NUL-truncated record disappears
@@ -345,6 +353,10 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
         return 1
         ;;
     esac
+    if [ "$kind" = bypass ]; then
+      bypasses="$bypasses$FM_VERIFY_REC_F4$FM_VERIFY_TAB$FM_VERIFY_REC_F5$FM_VERIFY_NL"
+      continue
+    fi
     [ "$kind" = verify ] || continue
     [ "$FM_VERIFY_REC_SHA" = "$sha" ] || continue
     found=1
@@ -382,10 +394,6 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
           esac
           ;;
         failed)
-          case "$failed" in
-            *",$name,"*) ;;
-            *) failed="$failed,$name," ;;
-          esac
           [ -n "$first_failed_step" ] || first_failed_step=$name
           ;;
         *)
@@ -436,15 +444,19 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
 
   # Rule 4: any recorded bypass survives unless the exact commit has positive
   # evidence for every step it named. Both durable homes are consulted, because
-  # this is the one rule the gate cannot check against evidence of its own.
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [ -z "$line" ] || ! fm_verify_record_split "$line"; then
-      FM_VERIFY_REFUSAL="the verification ledger holds a record this gate cannot read, so what was verified cannot be established"
-      return 1
-    fi
-    [ "$FM_VERIFY_REC_KIND" = bypass ] || continue
-    fm_verify_bypass_survives "$FM_VERIFY_REC_F4" "$FM_VERIFY_REC_F5" "$passed" "$sha" && return 1
-  done < "$ledger"
+  # this is the one rule the gate cannot check against evidence of its own. The
+  # ledger's bypasses were collected by the single pass above; neither field can
+  # hold a TAB or a newline, because the split rejects a seventh field and `read`
+  # ends a record at the newline.
+  rest=$bypasses
+  while [ -n "$rest" ]; do
+    line=${rest%%"$FM_VERIFY_NL"*}
+    rest=${rest#*"$FM_VERIFY_NL"}
+    [ -n "$line" ] || continue
+    what=${line%%"$FM_VERIFY_TAB"*}
+    why=${line#*"$FM_VERIFY_TAB"}
+    fm_verify_bypass_survives "$what" "$why" "$passed" "$sha" && return 1
+  done
 
   if [ -n "$meta" ] && [ -f "$meta" ] && [ ! -L "$meta" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
@@ -753,13 +765,17 @@ fm_verify_record_override() {  # <ledger> <meta> <sha> <reason> <path>
 
 # fm_verify_record_bypass <ledger> <meta> <sha> <what> <why> <by>: the same
 # durable half for a bypass. The ledger is the primary trail; the metadata note
-# is the copy that survives losing it. A bypass that lands in only one of them is
-# a bypass the gate might not see, so both must be written or nothing is.
+# is the copy that survives losing it. A task with no metadata at all still gets
+# its ledger record. Metadata that exists but cannot be written refuses, rather
+# than losing the copy silently - and the ledger record is deliberately kept, so
+# the bypass still blocks the merge while only its second home is missing. That
+# case returns 2, so the caller can say which of the two homes is missing; 1 is
+# the ledger append itself failing, where nothing was recorded.
 fm_verify_record_bypass() {  # <ledger> <meta> <sha> <what> <why> <by>
   local ledger=$1 meta=$2 sha=$3 what=$4 why=$5 by=$6
   fm_verify_append "$ledger" bypass "$sha" "$what" "$why" "$by" || return 1
   if [ -e "$meta" ] || [ -L "$meta" ]; then
-    fm_verify_meta_note_bypass "$meta" "$what" "$why" || return 1
+    fm_verify_meta_note_bypass "$meta" "$what" "$why" || return 2
   fi
   return 0
 }
