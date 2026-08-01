@@ -334,6 +334,7 @@ Its `Stop` command fires only when the current workspace holds a `.fm-grok-turne
 The hook reads `$GROK_WORKSPACE_ROOT`, which is always set for hooks and equals the worktree.
 This keeps the hook outside the worktree, needs no trust grant, and writes only firstmate-owned files.
 `fm-teardown` removes the worktree pointer before returning a pooled worktree.
+`fm-spawn` scrubs leftover worktree turn-end pointers and hook files as well, including the other harnesses', because a pooled slot can come back without a clean teardown and grok reads a claude crew's leftover `<worktree>/.claude/settings.local.json` as a project hook, which then wakes firstmate for the task that left; `bin/fm-spawn.sh`'s header owns that scrub's scope and its committed-file exception.
 Secondmate spawns skip the pointer (idle panes are healthy, no stale-pane detection for them).
 
 **Primary-session guard fact (verified 2026-07-08, Grok 0.2.91).**

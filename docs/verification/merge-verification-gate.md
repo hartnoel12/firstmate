@@ -55,7 +55,7 @@ A gate that cannot be satisfied exactly when it matters most is a gate agents ro
 
 ## Refusals observed firing
 
-Date: 2026-07-26.
+Date: 2026-07-26, re-recorded 2026-08-01 when the duplicate-run and bypass-recording cases were added.
 Command: `bash tests/fm-merge-verification.test.sh`.
 Each case constructs the failing situation against the real scripts and real git repositories, and asserts that nothing landed - local `main` did not move, or the forge CLI was never asked to merge - rather than asserting on message text.
 
@@ -89,7 +89,7 @@ ok - a bypass is recorded in both durable homes, not just the ledger
 ok - a recorded bypass still refuses when the ledger loses, truncates, or corrupts it
 ```
 
-Six of those cases guard the gate's own record-keeping rather than a merge refusal, and each was watched failing against the pre-fix scripts before being encoded.
+Seven of those cases guard the gate's own record-keeping rather than a merge refusal, and each was watched failing against the pre-fix scripts before being encoded.
 The override's metadata note is inserted before the `pr=` line, because `bin/fm-pr-lib.sh` treats everything after `pr=` as post-recording injection and an override reason is operator free text.
 That rewrite checks every write and then proves the replacement is the original plus exactly the note line before it replaces anything, so a filesystem that fills partway through refuses the override instead of installing a plausible-looking truncation, and its temporary copy of the metadata is removed on signal as well as on every return path.
 
