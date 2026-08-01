@@ -528,9 +528,12 @@ fm_verify_override_valid() {  # <reason>
 # fm_verify_override_banner <sha> <reason> <refusal>: the banner text. It lives
 # in a function body rather than inline in a `banner=$(cat <<EOF ...)`, because
 # Bash 3.2 tracks quote state through a heredoc while scanning for the closing
-# `)` of a command substitution: one apostrophe in an operator's override reason
-# would break the parse of this whole file on a macOS fleet member.
-# bin/fm-bash-syntax-check.sh's header owns that rule and its full rationale.
+# `)` of a command substitution: one apostrophe written into the banner PROSE
+# below would break the parse of this whole file on a macOS fleet member. The
+# hazard is the literal source text, not the operator's $reason, which arrives
+# at runtime and never reaches the parser - so this wording is one edit away
+# from the failure at any time. bin/fm-bash-syntax-check.sh's header owns that
+# rule and its full rationale, and the ban on the idiom is structural.
 fm_verify_override_banner() {  # <sha> <reason> <refusal>
   local sha=$1 reason=$2 refusal=$3
   cat <<EOF
