@@ -36,21 +36,49 @@
 # THE GATE (fm_verify_gate) refuses unless ALL of these hold for the exact
 # commit being merged:
 #
-#   1. a verify record exists whose sha equals that commit - a run on the same
-#      BRANCH is not evidence, because the branch moves;
-#   2. that record's outcome is passed and every step in it is passed;
-#   3. every step the project declares required (config/verify/<project>) has a
-#      passing record in it - a declared step absent from the run is a SKIPPED
+#   1. at least one verify record exists whose sha equals that commit - a run on
+#      the same BRANCH is not evidence, because the branch moves;
+#   2. EVERY verify record for that commit passed, and no step named in any of
+#      them is recorded failed (see PRECEDENCE below);
+#   3. every step the project declares required (config/verify/<project>) is in
+#      the passing union - a declared step absent from every run is a SKIPPED
 #      step, and skipped is not passed;
-#   4. no bypass recorded against the task survives. A bypass naming steps is
-#      superseded only by positive evidence: each named step must itself appear
-#      passing in the winning record for this exact commit. An unbound or '*'
-#      bypass can never be superseded, so it always refuses.
+#   4. no bypass recorded against the task survives, in EITHER durable record
+#      (see TWO RECORDS below). A bypass naming steps is superseded only by
+#      positive evidence: each named step must itself be in the passing union
+#      for this exact commit. An unbound or '*' bypass can never be superseded,
+#      so it always refuses.
 #
 # Rule 4 is what makes an unaccounted-for bypass fail CLOSED. Recording a
 # bypass cannot make a merge easier - only harder - so the record has no
 # incentive to be omitted, and omitting it is the one failure mode firstmate
 # must not reward.
+#
+# PRECEDENCE, when one commit carries more than one run of the same step.
+# The worst outcome wins and it is sticky: a step counts as passed only when it
+# is recorded passed at least once and recorded failed no times, and a run whose
+# outcome is not `passed` disqualifies its commit outright. Neither naive rule
+# is acceptable here. Latest-wins is worse than useless, because the tree did
+# not change between the two runs - the disagreement is the step's own
+# nondeterminism, not progress - so resolving it in favour of the later pass
+# makes re-running the cheapest way to launder a red result into a green one.
+# First-wins has the mirror problem. Worst-wins states the honest reading: a
+# step that passes sometimes and fails sometimes at one commit has not verified
+# that commit. The ways past it are the honest ones that already exist - change
+# the commit (fixing a flaky step is itself a code change, and a new commit gets
+# a clean slate), record a bypass, or take the loud recorded override.
+#
+# TWO RECORDS FOR A BYPASS. A bypass is written to the ledger AND to the task's
+# metadata (`bypassed=<what>|<why>`), the same belt-and-braces the override has
+# always used, and the gate consults both. This is deliberately not the elegant
+# design: it exists because the ledger is the one input the gate cannot verify
+# for itself. Every other rule is checked against evidence the gate produces;
+# rule 4 is checked against a record something else had to write, so losing that
+# file, truncating its last line, or damaging one byte of it must not quietly
+# turn a bypassed merge into a clean one. For the same reason every record this
+# gate reads is parsed strictly: a line it cannot split into exactly six fields,
+# or whose kind it does not recognise, refuses the merge instead of being
+# skipped as noise.
 #
 # Sourced by bin/fm-verify.sh, bin/fm-pr-merge.sh, bin/fm-merge-local.sh, and
 # the tests. No side effects on source. set -u / set -e safe.
@@ -204,6 +232,55 @@ fm_verify_required_steps() {
   printf '%s' "$out"
 }
 
+# --- reading records back ---------------------------------------------------
+
+# The record separator, as a variable so the split below can quote it into a
+# pattern. Assigned once on source; harmless to reassign.
+FM_VERIFY_TAB=$(printf '\t')
+
+# fm_verify_record_split <line>: split one ledger line into exactly six fields,
+# leaving them in FM_VERIFY_REC_*. Returns non-zero for anything else.
+#
+# `IFS=$'\t' read -r a b c ...` cannot be used for this. TAB is IFS whitespace,
+# so read folds a run of tabs into a single separator: one empty field and every
+# field after it shifts left, turning a bypass's `why` into its `what` with no
+# error anywhere. Writers never emit an empty field (fm_verify_field_clean maps
+# empty to '-'), so a line that needs that folding is a damaged line, and the
+# gate must refuse it rather than read it wrong.
+FM_VERIFY_REC_KIND=''
+FM_VERIFY_REC_TS=''
+FM_VERIFY_REC_SHA=''
+FM_VERIFY_REC_F4=''
+FM_VERIFY_REC_F5=''
+FM_VERIFY_REC_F6=''
+fm_verify_record_split() {  # <line>
+  local rest=$1 field n=0
+  FM_VERIFY_REC_KIND=''
+  FM_VERIFY_REC_TS=''
+  FM_VERIFY_REC_SHA=''
+  FM_VERIFY_REC_F4=''
+  FM_VERIFY_REC_F5=''
+  FM_VERIFY_REC_F6=''
+  while [ "$n" -lt 5 ]; do
+    field=${rest%%"$FM_VERIFY_TAB"*}
+    [ "$field" != "$rest" ] || return 1
+    rest=${rest#*"$FM_VERIFY_TAB"}
+    n=$((n + 1))
+    case "$n" in
+      1) FM_VERIFY_REC_KIND=$field ;;
+      2) FM_VERIFY_REC_TS=$field ;;
+      3) FM_VERIFY_REC_SHA=$field ;;
+      4) FM_VERIFY_REC_F4=$field ;;
+      5) FM_VERIFY_REC_F5=$field ;;
+    esac
+  done
+  case "$rest" in
+    *"$FM_VERIFY_TAB"*) return 1 ;;
+  esac
+  FM_VERIFY_REC_F6=$rest
+  return 0
+}
+
 # --- the gate ---------------------------------------------------------------
 
 # Set by fm_verify_gate on refusal: one plain sentence naming what is missing.
@@ -212,14 +289,29 @@ FM_VERIFY_REFUSAL=''
 # merge output, so a passing gate still says what it actually checked.
 FM_VERIFY_EVIDENCE=''
 
-# fm_verify_gate <ledger> <sha> <required-csv>: 0 when the exact commit has
-# genuine, complete, unbypassed local verification evidence. 1 otherwise, with
-# FM_VERIFY_REFUSAL explaining which of the four rules failed.
-fm_verify_gate() {  # <ledger> <sha> <required-csv>
-  local ledger=$1 sha=$2 required=${3:-}
-  local kind rec_sha win_outcome='' win_steps='' found=0
-  local outcome steps what why pair name status req verified=''
-  local -a parts=()
+# fm_verify_csv_next <csv>: echo "<head>|<tail>" for a comma-separated list, so
+# the gate can walk one without building an array. An empty array expanded as
+# "${a[@]}" is a fatal unbound-variable error under `set -u` on Bash 3.2, which
+# is the system Bash on the macOS half of this fleet, so the gate walks strings.
+fm_verify_csv_head() { printf '%s' "${1%%,*}"; }
+fm_verify_csv_tail() {
+  local csv=$1
+  case "$csv" in
+    *,*) printf '%s' "${csv#*,}" ;;
+    *) printf '%s' '' ;;
+  esac
+}
+
+# fm_verify_gate <ledger> <sha> <required-csv> [<meta>]: 0 when the exact commit
+# has genuine, complete, unbypassed local verification evidence. 1 otherwise,
+# with FM_VERIFY_REFUSAL explaining which of the four rules failed. <meta> is the
+# task's metadata file, the bypass record's second home; omitting it consults the
+# ledger alone.
+fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
+  local ledger=$1 sha=$2 required=${3:-} meta=${4:-}
+  local line kind outcome steps what why value
+  local found=0 rest pair name status req run_failed=0
+  local passed='' failed='' evidence='' first_failed_step=''
 
   FM_VERIFY_REFUSAL=''
   FM_VERIFY_EVIDENCE=''
@@ -233,86 +325,174 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv>
     return 1
   fi
 
-  # Rule 1: the winning record is the LAST verify record bound to this exact
-  # commit. Later re-verification of the same commit supersedes earlier runs;
-  # a run on any other commit is not evidence for this one.
-  while IFS=$'\t' read -r kind _ rec_sha outcome steps _; do
+  # One strict pass over the ledger. `|| [ -n "$line" ]` keeps the final record
+  # when the file lost its trailing newline: without it the LAST line is dropped
+  # silently, and the last line is exactly where a freshly recorded bypass is.
+  while IFS= read -r line || [ -n "$line" ]; do
+    # A blank line is not a record this file's writers can produce, so it is
+    # damage, not noise: skipping it is how a NUL-truncated record disappears
+    # (Bash 3.2's read stops at a NUL and hands back an empty line, where Bash 5
+    # hands back the bytes after it).
+    if [ -z "$line" ] || ! fm_verify_record_split "$line"; then
+      FM_VERIFY_REFUSAL="the verification ledger holds a record this gate cannot read, so what was verified cannot be established"
+      return 1
+    fi
+    kind=$FM_VERIFY_REC_KIND
+    case "$kind" in
+      verify|bypass|override) ;;
+      *)
+        FM_VERIFY_REFUSAL="the verification ledger holds a record of unknown kind '$kind', so what was verified cannot be established"
+        return 1
+        ;;
+    esac
     [ "$kind" = verify ] || continue
-    [ "$rec_sha" = "$sha" ] || continue
-    win_outcome=$outcome
-    win_steps=$steps
+    [ "$FM_VERIFY_REC_SHA" = "$sha" ] || continue
     found=1
+    outcome=$FM_VERIFY_REC_F4
+    steps=$FM_VERIFY_REC_F5
+    case "$outcome" in
+      passed|failed) ;;
+      *)
+        FM_VERIFY_REFUSAL="a verification run recorded for commit $sha has an unreadable outcome ('$outcome')"
+        return 1
+        ;;
+    esac
+    # Precedence (see header): a run that did not pass disqualifies its commit
+    # outright, whatever a later run of the same commit says.
+    [ "$outcome" = passed ] || run_failed=1
+    if [ -z "$steps" ] || [ "$steps" = '-' ]; then
+      continue
+    fi
+    rest=$steps
+    while [ -n "$rest" ]; do
+      pair=$(fm_verify_csv_head "$rest")
+      rest=$(fm_verify_csv_tail "$rest")
+      [ -n "$pair" ] || continue
+      name=${pair%%:*}
+      status=${pair#*:}
+      if [ -z "$name" ] || [ "$name" = "$pair" ]; then
+        FM_VERIFY_REFUSAL="a verification record for commit $sha is malformed and cannot be trusted"
+        return 1
+      fi
+      case "$status" in
+        passed)
+          case "$passed" in
+            *",$name,"*) ;;
+            *) passed="$passed,$name,"; evidence="${evidence:+$evidence,}$name:passed" ;;
+          esac
+          ;;
+        failed)
+          case "$failed" in
+            *",$name,"*) ;;
+            *) failed="$failed,$name," ;;
+          esac
+          [ -n "$first_failed_step" ] || first_failed_step=$name
+          ;;
+        *)
+          FM_VERIFY_REFUSAL="verification step '$name' has an unreadable result ('$status') for commit $sha"
+          return 1
+          ;;
+      esac
+    done
   done < "$ledger"
 
+  # Rule 1: some run is bound to this exact commit.
   if [ "$found" -eq 0 ]; then
     FM_VERIFY_REFUSAL="no local verification run is recorded for commit $sha (a run on the same branch is not evidence: the branch moves)"
     return 1
   fi
 
-  # Rule 2: the run genuinely passed, step by step.
-  if [ "$win_outcome" != passed ]; then
-    FM_VERIFY_REFUSAL="the verification run recorded for commit $sha did not pass (outcome: $win_outcome)"
+  # Rule 2: nothing recorded for this commit failed. Worst outcome wins, so a
+  # later passing re-run of the same commit does not erase an earlier failure.
+  if [ -n "$first_failed_step" ] || [ "$run_failed" -eq 1 ]; then
+    if [ -n "$first_failed_step" ]; then
+      why="step '$first_failed_step' is recorded failed"
+    else
+      why="a run for this commit is recorded failed"
+    fi
+    FM_VERIFY_REFUSAL="the verification recorded for commit $sha did not pass ($why); a later passing run of the same commit does not supersede that, because the code did not change between them"
     return 1
   fi
-  if [ -z "$win_steps" ] || [ "$win_steps" = '-' ]; then
-    FM_VERIFY_REFUSAL="the verification run recorded for commit $sha checked nothing"
+  if [ -z "$passed" ]; then
+    FM_VERIFY_REFUSAL="the verification recorded for commit $sha checked nothing"
     return 1
   fi
-  IFS=',' read -r -a parts <<< "$win_steps"
-  for pair in "${parts[@]}"; do
-    name=${pair%%:*}
-    status=${pair#*:}
-    if [ -z "$name" ] || [ "$name" = "$pair" ]; then
-      FM_VERIFY_REFUSAL="the verification record for commit $sha is malformed and cannot be trusted"
-      return 1
-    fi
-    if [ "$status" != passed ]; then
-      FM_VERIFY_REFUSAL="verification step '$name' is recorded as $status for commit $sha"
-      return 1
-    fi
-    verified="$verified,$name,"
+
+  # Rule 3: a declared step missing from every run was skipped, and skipped is
+  # not passed.
+  rest=$required
+  while [ -n "$rest" ]; do
+    req=$(fm_verify_csv_head "$rest")
+    rest=$(fm_verify_csv_tail "$rest")
+    [ -n "$req" ] || continue
+    case "$passed" in
+      *",$req,"*) ;;
+      *)
+        FM_VERIFY_REFUSAL="required verification step '$req' has no passing record for commit $sha (declared for this project but not run)"
+        return 1
+        ;;
+    esac
   done
 
-  # Rule 3: a declared step missing from the run was skipped, and skipped is
-  # not passed.
-  if [ -n "$required" ]; then
-    IFS=',' read -r -a parts <<< "$required"
-    for req in "${parts[@]}"; do
-      [ -n "$req" ] || continue
-      case "$verified" in
-        *",$req,"*) ;;
-        *)
-          FM_VERIFY_REFUSAL="required verification step '$req' has no passing record for commit $sha (declared for this project but not run)"
-          return 1
-          ;;
-      esac
-    done
-  fi
-
   # Rule 4: any recorded bypass survives unless the exact commit has positive
-  # evidence for every step it named.
-  while IFS=$'\t' read -r kind _ _ what why _; do
-    [ "$kind" = bypass ] || continue
-    if [ "$what" = '*' ] || [ "$what" = '-' ]; then
-      FM_VERIFY_REFUSAL="an unscoped bypass is recorded against this task ($why) and nothing can supersede it"
+  # evidence for every step it named. Both durable homes are consulted, because
+  # this is the one rule the gate cannot check against evidence of its own.
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ] || ! fm_verify_record_split "$line"; then
+      FM_VERIFY_REFUSAL="the verification ledger holds a record this gate cannot read, so what was verified cannot be established"
       return 1
     fi
-    IFS=',' read -r -a parts <<< "$what"
-    for name in "${parts[@]}"; do
-      [ -n "$name" ] || continue
-      case "$verified" in
-        *",$name,"*) ;;
-        *)
-          FM_VERIFY_REFUSAL="a bypass of '$name' is recorded against this task ($why) and '$name' has no passing record for commit $sha"
-          return 1
-          ;;
-      esac
-    done
+    [ "$FM_VERIFY_REC_KIND" = bypass ] || continue
+    fm_verify_bypass_survives "$FM_VERIFY_REC_F4" "$FM_VERIFY_REC_F5" "$passed" "$sha" && return 1
   done < "$ledger"
 
+  if [ -n "$meta" ] && [ -f "$meta" ] && [ ! -L "$meta" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        bypassed=*) ;;
+        *) continue ;;
+      esac
+      value=${line#bypassed=}
+      what=${value%%|*}
+      if [ "$what" = "$value" ]; then
+        why='-'
+      else
+        why=${value#*|}
+      fi
+      fm_verify_bypass_survives "$what" "$why" "$passed" "$sha" && return 1
+    done < "$meta"
+  fi
+
   # shellcheck disable=SC2034  # Read by the sourcing merge scripts.
-  FM_VERIFY_EVIDENCE=$win_steps
+  FM_VERIFY_EVIDENCE=$evidence
   return 0
+}
+
+# fm_verify_bypass_survives <what> <why> <passed-set> <sha>: 0 (and sets
+# FM_VERIFY_REFUSAL) when this bypass still blocks the merge. An unscoped or
+# unreadable `what` can never be superseded, so it always survives.
+fm_verify_bypass_survives() {  # <what> <why> <passed-set> <sha>
+  local what=$1 why=$2 passed=$3 sha=$4 rest name
+  case "$what" in
+    ''|'*'|'-')
+      FM_VERIFY_REFUSAL="an unscoped bypass is recorded against this task ($why) and nothing can supersede it"
+      return 0
+      ;;
+  esac
+  rest=$what
+  while [ -n "$rest" ]; do
+    name=$(fm_verify_csv_head "$rest")
+    rest=$(fm_verify_csv_tail "$rest")
+    [ -n "$name" ] || continue
+    case "$passed" in
+      *",$name,"*) ;;
+      *)
+        FM_VERIFY_REFUSAL="a bypass of '$name' is recorded against this task ($why) and '$name' has no passing record for commit $sha"
+        return 0
+        ;;
+    esac
+  done
+  return 1
 }
 
 # --- the override -----------------------------------------------------------
@@ -333,11 +513,15 @@ fm_verify_override_valid() {  # <reason>
   return 0
 }
 
-# fm_verify_override_announce <sha> <reason> <refusal>: the loud half. Printed
-# to BOTH stdout and stderr so it survives whichever stream the caller keeps.
-fm_verify_override_announce() {  # <sha> <reason> <refusal>
-  local sha=$1 reason=$2 refusal=$3 banner
-  banner=$(cat <<EOF
+# fm_verify_override_banner <sha> <reason> <refusal>: the banner text. It lives
+# in a function body rather than inline in a `banner=$(cat <<EOF ...)`, because
+# Bash 3.2 tracks quote state through a heredoc while scanning for the closing
+# `)` of a command substitution: one apostrophe in an operator's override reason
+# would break the parse of this whole file on a macOS fleet member.
+# bin/fm-bash-syntax-check.sh's header owns that rule and its full rationale.
+fm_verify_override_banner() {  # <sha> <reason> <refusal>
+  local sha=$1 reason=$2 refusal=$3
+  cat <<EOF
 ################################################################################
 ##  MERGING WITHOUT VERIFICATION EVIDENCE
 ##  commit : $sha
@@ -346,23 +530,37 @@ fm_verify_override_announce() {  # <sha> <reason> <refusal>
 ##  This override is recorded in the task's verification ledger and metadata.
 ################################################################################
 EOF
-)
+}
+
+# fm_verify_override_announce <sha> <reason> <refusal>: the loud half. Printed
+# to BOTH stdout and stderr so it survives whichever stream the caller keeps.
+fm_verify_override_announce() {  # <sha> <reason> <refusal>
+  local banner
+  banner=$(fm_verify_override_banner "$@")
   printf '%s\n' "$banner"
   printf '%s\n' "$banner" >&2
 }
 
-# --- the override's copy in task metadata -----------------------------------
+# --- the second home for bypasses and overrides -----------------------------
 #
 # bin/fm-pr-lib.sh parses a task's .meta under a strict rule: after the pr= line
 # nothing but pr_head= and a short x_* allowlist may appear, because everything
-# else there is treated as post-recording injection. An override reason is
-# operator free text - precisely what that guard exists to reject - so appending
-# the note would invalidate the metadata for every later reader of it (the armed
-# poll's retirement receipt, the check migration's canonicality test). The note
-# is therefore INSERTED BEFORE the first pr= line, through the same
-# temp-file-then-mv rewrite bin/fm-pr-check.sh uses, preserving 0600, the single
-# link, and the containing device. The ledger stays the primary trail; this copy
-# must never cost the metadata it rides along in.
+# else there is treated as post-recording injection. An override reason and a
+# bypass reason are operator free text - precisely what that guard exists to
+# reject - so appending the note would invalidate the metadata for every later
+# reader of it (the armed poll's retirement receipt, the check migration's
+# canonicality test). The note is therefore INSERTED BEFORE the first pr= line,
+# through the same temp-file-then-mv rewrite bin/fm-pr-check.sh uses, preserving
+# 0600, the single link, and the containing device. bin/fm-pr-check.sh rebuilds
+# the file by keeping every non-pr line and re-appending pr=/pr_head= last, so a
+# note written here stays ahead of pr= across later PR recordings.
+#
+# Two notes ride along here:
+#   merged_unverified=<sha>|<reason>   an override that was taken
+#   bypassed=<what>|<why>              a gate firstmate authorized to be skipped
+#
+# The ledger stays the primary trail; these copies must never cost the metadata
+# they ride along in.
 
 fm_verify_file_device() {
   if [ "$(uname)" = Darwin ]; then
@@ -481,19 +679,29 @@ fm_verify_meta_rewrite_faithful() {  # <meta> <tmp> <note> <before>
 }
 
 # fm_verify_meta_note_override <meta> <sha> <reason>: write one
-# merged_unverified=<sha>|<reason> line into <meta>, before its first pr= line
-# or at the end when it has none. The original is left untouched unless the
-# replacement is proven complete, because an override that cannot be recorded
-# is an override that is not taken.
+# merged_unverified=<sha>|<reason> line into <meta>. An override that cannot be
+# recorded is an override that is not taken.
 fm_verify_meta_note_override() {  # <meta> <sha> <reason>
-  local meta=$1 sha=$2 reason=$3 dir device note before rc=0
+  fm_verify_meta_note_write "$1" "merged_unverified=$2|$(fm_verify_field_clean "$3")"
+}
+
+# fm_verify_meta_note_bypass <meta> <what> <why>: write one
+# bypassed=<what>|<why> line into <meta>, the bypass record's second home.
+fm_verify_meta_note_bypass() {  # <meta> <what> <why>
+  fm_verify_meta_note_write "$1" "bypassed=$(fm_verify_field_clean "$2")|$(fm_verify_field_clean "$3")"
+}
+
+# fm_verify_meta_note_write <meta> <note>: write one <note> line into <meta>,
+# before its first pr= line or at the end when it has none. The original is left
+# untouched unless the replacement is proven complete.
+fm_verify_meta_note_write() {  # <meta> <note>
+  local meta=$1 note=$2 dir device before rc=0
   [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
   [ "$(fm_verify_file_link_count "$meta")" = 1 ] || return 1
   dir=$(dirname -- "$meta")
   device=$(fm_verify_file_device "$dir") || return 1
   [ -n "$device" ] || return 1
   [ "$(fm_verify_file_device "$meta")" = "$device" ] || return 1
-  note="merged_unverified=$sha|$(fm_verify_field_clean "$reason")"
   before=$(fm_verify_meta_note_count "$meta" "$note") || return 1
 
   fm_verify_meta_trap_arm
@@ -539,6 +747,19 @@ fm_verify_record_override() {  # <ledger> <meta> <sha> <reason> <path>
   # silently.
   if [ -e "$meta" ] || [ -L "$meta" ]; then
     fm_verify_meta_note_override "$meta" "$sha" "$reason" || return 1
+  fi
+  return 0
+}
+
+# fm_verify_record_bypass <ledger> <meta> <sha> <what> <why> <by>: the same
+# durable half for a bypass. The ledger is the primary trail; the metadata note
+# is the copy that survives losing it. A bypass that lands in only one of them is
+# a bypass the gate might not see, so both must be written or nothing is.
+fm_verify_record_bypass() {  # <ledger> <meta> <sha> <what> <why> <by>
+  local ledger=$1 meta=$2 sha=$3 what=$4 why=$5 by=$6
+  fm_verify_append "$ledger" bypass "$sha" "$what" "$why" "$by" || return 1
+  if [ -e "$meta" ] || [ -L "$meta" ]; then
+    fm_verify_meta_note_bypass "$meta" "$what" "$why" || return 1
   fi
   return 0
 }

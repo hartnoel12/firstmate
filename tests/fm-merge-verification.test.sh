@@ -35,6 +35,10 @@
 #   (q) a declared step set that exists but is unusable refuses, and never
 #       reads as "this project declares nothing"
 #   (r) a declared step that reads stdin cannot swallow the steps after it
+#   (s) one commit carrying both a failed and a passing run of the same step
+#       refuses in either order, while repeated passing runs still merge
+#   (t) a bypass stays visible to the gate when the ledger loses it, loses its
+#       trailing newline, or has one byte of its record damaged
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -696,6 +700,137 @@ test_declared_step_cannot_eat_the_step_list() {
   pass "a declared step that reads stdin cannot swallow the steps after it"
 }
 
+# --- (s) one commit, two runs of the same step, disagreeing ------------------
+#
+# The ambiguous case, tested in both orders and against its own control. Same
+# commit means same tree, so a step that fails once and passes once has not
+# verified anything; resolving that in favour of the pass is exactly how a red
+# change lands looking green. bin/fm-verify-lib.sh's PRECEDENCE note owns the
+# rule. Both runs here are real: fm-verify.sh executes ./fail.sh and ./pass.sh
+# and records the exit codes it observed.
+
+test_duplicate_runs_refuse_in_either_order() {
+  local case_dir before order
+  for order in fail-then-pass pass-then-fail; do
+    case_dir=$(make_case "dup-$order" local-only)
+    before=$(main_of "$case_dir")
+
+    if [ "$order" = fail-then-pass ]; then
+      run "$case_dir" v1 "$VERIFY" run task-x1 --step flaky -- ./fail.sh
+      expect_code 1 "$RC" "dup-$order: the failing run should report its failure"
+      run "$case_dir" v2 "$VERIFY" run task-x1 --step flaky -- ./pass.sh
+      expect_code 0 "$RC" "dup-$order: the passing re-run should record"
+    else
+      run "$case_dir" v1 "$VERIFY" run task-x1 --step flaky -- ./pass.sh
+      expect_code 0 "$RC" "dup-$order: the passing run should record"
+      run "$case_dir" v2 "$VERIFY" run task-x1 --step flaky -- ./fail.sh
+      expect_code 1 "$RC" "dup-$order: the failing re-run should report its failure"
+    fi
+
+    # Both runs are genuinely bound to the same commit; without that the case
+    # would prove nothing about precedence.
+    [ "$(grep -c "	$(tip "$case_dir")	" "$case_dir/state/task-x1.verification")" -eq 2 ] \
+      || fail "dup-$order: fixture did not record two runs for one commit"
+
+    run "$case_dir" merge "$MERGE_LOCAL" task-x1
+    expect_code 4 "$RC" "dup-$order: a commit carrying a failed run must not merge"
+    assert_not_merged_local "$case_dir" "$before" \
+      "dup-$order: local main moved on a commit whose step is recorded failed"
+  done
+  pass "a commit carrying both a failed and a passing run of one step refuses in either order"
+}
+
+# The control the rule must not break: re-running a step that passes both times
+# is ordinary, and must still merge.
+test_repeated_passing_runs_still_merge() {
+  local case_dir
+  case_dir=$(make_case dup-pass-twice local-only)
+
+  run "$case_dir" v1 "$VERIFY" run task-x1 --step test -- ./pass.sh
+  expect_code 0 "$RC" "dup-pass-twice: the first passing run should record"
+  run "$case_dir" v2 "$VERIFY" run task-x1 --step test -- ./pass.sh
+  expect_code 0 "$RC" "dup-pass-twice: the second passing run should record"
+
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  expect_code 0 "$RC" "dup-pass-twice: two passing runs of one commit should merge"
+  [ "$(main_of "$case_dir")" = "$(tip "$case_dir")" ] \
+    || fail "dup-pass-twice: the verified commit did not land"
+  pass "two passing runs of the same commit still merge"
+}
+
+# Steps from separate runs of one commit combine, so splitting a verification
+# across two invocations satisfies a declared step set.
+test_steps_from_separate_runs_combine() {
+  local case_dir
+  case_dir=$(make_case dup-union local-only)
+  mkdir -p "$case_dir/config/verify"
+  printf 'lint = ./pass.sh\ntest = ./pass.sh\n' > "$case_dir/config/verify/myproj"
+
+  run "$case_dir" v1 "$VERIFY" run task-x1 --step lint -- ./pass.sh
+  expect_code 0 "$RC" "dup-union: the lint run should record"
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  expect_code 4 "$RC" "dup-union: one of two declared steps is not a complete verification"
+
+  run "$case_dir" v2 "$VERIFY" run task-x1 --step test -- ./pass.sh
+  expect_code 0 "$RC" "dup-union: the test run should record"
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  expect_code 0 "$RC" "dup-union: both declared steps passed for this commit"
+  [ "$(main_of "$case_dir")" = "$(tip "$case_dir")" ] \
+    || fail "dup-union: the fully verified commit did not land"
+  pass "steps passing across separate runs of one commit combine into one verification"
+}
+
+# --- (t) a bypass the ledger no longer carries ------------------------------
+#
+# Rule 4 is the one rule the gate cannot check against evidence of its own: it
+# depends on a record something else had to write. Each case here damages that
+# record in a way that used to make the bypass invisible, and asserts the merge
+# still refuses and local main still did not move.
+
+bypass_case() {  # <name> -> case dir with a passing run and a bypass of 'ci'
+  local case_dir=$1
+  case_dir=$(make_case "$case_dir" local-only)
+  verify_pass "$case_dir"
+  run "$case_dir" bypass "$VERIFY" bypass task-x1 --step ci --why 'ci board dark on budget' --by firstmate
+  expect_code 0 "$RC" "$1: recording the bypass failed"
+  printf '%s\n' "$case_dir"
+}
+
+test_bypass_is_recorded_in_both_homes() {
+  local case_dir
+  case_dir=$(bypass_case bypass-two-homes)
+  assert_grep 'bypass' "$case_dir/state/task-x1.verification" \
+    "bypass-two-homes: the ledger has no bypass record"
+  assert_grep 'bypassed=ci|ci board dark on budget' "$case_dir/state/task-x1.meta" \
+    "bypass-two-homes: the task metadata has no bypass record"
+  pass "a bypass is recorded in both durable homes, not just the ledger"
+}
+
+test_bypass_survives_a_damaged_ledger() {
+  local case_dir before label
+  for label in ledger-lost no-trailing-newline corrupted-kind; do
+    case_dir=$(bypass_case "bypass-$label")
+    before=$(main_of "$case_dir")
+    local ledger="$case_dir/state/task-x1.verification"
+
+    case "$label" in
+      # The bypass line is gone entirely; the passing run is left intact, so the
+      # gate has every reason to think this commit is cleanly verified.
+      ledger-lost) grep -v '^bypass	' "$ledger" > "$ledger.new" && mv "$ledger.new" "$ledger" ;;
+      # The file's last byte is lost, which is where a just-written bypass is.
+      no-trailing-newline) printf '%s' "$(cat "$ledger")" > "$ledger.new" && mv "$ledger.new" "$ledger" ;;
+      # One byte of the record's kind is damaged, so it is no longer 'bypass'.
+      corrupted-kind) sed 's/^bypass	/bypasx	/' "$ledger" > "$ledger.new" && mv "$ledger.new" "$ledger" ;;
+    esac
+
+    run "$case_dir" merge "$MERGE_LOCAL" task-x1
+    expect_code 4 "$RC" "bypass-$label: a bypassed gate must not merge"
+    assert_not_merged_local "$case_dir" "$before" \
+      "bypass-$label: local main moved over a bypass the ledger no longer shows"
+  done
+  pass "a recorded bypass still refuses when the ledger loses, truncates, or corrupts it"
+}
+
 test_local_refuses_without_any_record
 test_pr_refuses_without_any_record
 test_local_refuses_stale_record
@@ -718,3 +853,8 @@ test_repeated_identical_override_still_records
 test_override_reason_with_backslash_records
 test_unusable_declaration_refuses
 test_declared_step_cannot_eat_the_step_list
+test_duplicate_runs_refuse_in_either_order
+test_repeated_passing_runs_still_merge
+test_steps_from_separate_runs_combine
+test_bypass_is_recorded_in_both_homes
+test_bypass_survives_a_damaged_ledger

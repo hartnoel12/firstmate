@@ -144,9 +144,12 @@ if [ "$ACTION" = bypass ]; then
     SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || printf '%s' '-')
     fm_verify_sha_valid "$SHA" || SHA='-'
   fi
-  fm_verify_append "$LEDGER" bypass "$SHA" "$BY_STEPS" "$BY_WHY" "$BY_WHO" \
-    || die "could not record the bypass"
-  printf 'recorded bypass of %s for %s (%s)\n' "$BY_STEPS" "$ID" "$BY_WHY"
+  # Both durable homes or neither: bin/fm-verify-lib.sh owns why a bypass is
+  # written twice and what the gate does with each copy.
+  fm_verify_record_bypass "$LEDGER" "$META" "$SHA" "$BY_STEPS" "$BY_WHY" "$BY_WHO" \
+    || die "could not record the bypass durably; nothing was recorded as bypassed"
+  printf 'recorded bypass of %s for %s (%s), in both the ledger and the task record\n' \
+    "$BY_STEPS" "$ID" "$BY_WHY"
   printf 'Merging %s now refuses until those steps have passing evidence for the\n' "$ID"
   printf 'exact commit, or the merge is explicitly overridden.\n'
   exit 0

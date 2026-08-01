@@ -38,6 +38,9 @@
 #   (o) fm-pr-check rerun after HEAD moved                      -> no stale pr_head
 #   (p) fm-pr-check when local HEAD lags                        -> record remote PR head
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
+#   (q2) pushed to a fork, no local remote-tracking ref, open PR head
+#        matches HEAD exactly                                  -> ALLOW
+#   (q3) same, but one local commit sits past the PR head      -> REFUSE
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
@@ -485,6 +488,44 @@ fi
 exec "$real" "${args[@]}"
 SH
   chmod +x "$case_dir/fakebin/git"
+}
+
+# The forge answers PR 7 as <state> with head <head>, whatever `origin` points
+# at. Args: case_dir state head
+add_gh_pr_state_for_head() {
+  local case_dir=$1 state=$2 head=$3
+  cat > "$case_dir/fakebin/gh" <<SH
+#!/usr/bin/env bash
+case "\${1:-} \${2:-}" in
+  "pr view")
+    case " \$* " in
+      *"state,headRefOid"*) printf '%s\t%s\n' '$state' '$head' ; exit 0 ;;
+      *"headRefOid"*) printf '%s\n' '$head' ; exit 0 ;;
+    esac
+    ;;
+esac
+echo "error: pull request not found" >&2
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/gh"
+}
+
+# Push the task branch to a fork, repoint origin at it, and then drop the only
+# local remote-tracking ref for that branch - the state a captain's checkout is
+# left in when origin is repointed at a fork, or when a pruned head branch takes
+# the ref with it. The commits are genuinely on the remote throughout. Args: case_dir
+push_to_fork_and_lose_the_tracking_ref() {
+  local case_dir=$1
+  git init -q --bare "$case_dir/fork.git"
+  git -C "$case_dir/fork.git" symbolic-ref HEAD refs/heads/main
+  git -C "$case_dir/project" push -q "$case_dir/fork.git" main
+  git -C "$case_dir/project" remote set-url origin "$case_dir/fork.git"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/wt" update-ref -d refs/remotes/origin/fm/task-x1
+  git -C "$case_dir/wt" log --oneline HEAD --not --remotes -- | grep -q . \
+    || fail "fixture: git still sees this work as pushed, so the case proves nothing"
+  git -C "$case_dir/fork.git" cat-file -e "$(git -C "$case_dir/wt" rev-parse HEAD)^{commit}" \
+    || fail "fixture: the fork does not actually hold the work"
 }
 
 # Run teardown with PATH mocking. Args: case_dir [extra args...]
@@ -1371,7 +1412,58 @@ test_herdr_projection_teardown_retains_journal_when_close_unconfirmed() {
   pass "herdr projection teardown retains the stale journal and attempts no workspace cleanup when exact-pane close is unconfirmed"
 }
 
+# Work genuinely pushed to a fork, with no local remote-tracking ref left to say
+# so. The PR is OPEN - not merged - and its head is exactly this HEAD, which is
+# the same bar `git log HEAD --not --remotes` applies when the ref cache happens
+# to be warm. Teardown must tear down, not refuse a captain's pushed branch.
+test_pushed_to_fork_without_tracking_ref_allows() {
+  local case_dir rc
+  case_dir=$(make_case fork-no-tracking-ref)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  append_pr_meta_url "$case_dir"
+  push_to_fork_and_lose_the_tracking_ref "$case_dir"
+  add_gh_pr_state_for_head "$case_dir" OPEN "$(git -C "$case_dir/wt" rev-parse HEAD)"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "fork-no-tracking-ref: pushed work must not be refused as unlanded"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "fork-no-tracking-ref: teardown printed a REFUSED line for genuinely pushed work"
+  pass "work pushed to a fork with no local remote-tracking ref is torn down"
+}
+
+# The safety half of the same change. Identical shape, except one more local
+# commit was made after the push, so the PR head does not contain this HEAD.
+# That commit exists nowhere but this worktree and must still refuse.
+test_local_commit_beyond_the_pr_head_still_refuses() {
+  local case_dir rc pushed
+  case_dir=$(make_case fork-beyond-pr-head)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  append_pr_meta_url "$case_dir"
+  push_to_fork_and_lose_the_tracking_ref "$case_dir"
+  pushed=$(git -C "$case_dir/wt" rev-parse HEAD)
+  wt_commit_file "$case_dir" later.txt more "work after the push"
+  add_gh_pr_state_for_head "$case_dir" OPEN "$pushed"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "fork-beyond-pr-head: a commit past the PR head must refuse"
+  grep -q REFUSED "$case_dir/stderr" \
+    || fail "fork-beyond-pr-head: no REFUSED line for work the forge does not hold"
+  pass "a local commit past the PR head is still refused (safety preserved)"
+}
+
 test_local_only_fork_remote_allows
+test_pushed_to_fork_without_tracking_ref_allows
+test_local_commit_beyond_the_pr_head_still_refuses
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses

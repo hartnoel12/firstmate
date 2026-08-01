@@ -120,7 +120,9 @@ The gate is deliberately local rather than CI-shaped: this fleet's forge checks 
 Forge checks remain welcome corroboration and are never the requirement.
 
 Evidence is produced by `bin/fm-verify.sh`, which runs the verification commands itself in the task's worktree and records the real exit codes against the exact commit; it cannot record a claim.
-The per-task ledger lives in `state/<id>.verification`, and `bin/fm-verify-lib.sh` is the single owner of its format, the four gate rules, the bypass record, and the override.
+The per-task ledger lives in `state/<id>.verification`, and an authorized bypass is recorded in the task's own metadata as well, so losing or damaging either file cannot hide it.
+When one commit carries more than one run of the same step, the worst outcome wins and is sticky.
+`bin/fm-verify-lib.sh` is the single owner of both records' format, the four gate rules, that precedence rule and the reasoning behind it, the bypass record, and the override.
 
 An optional per-project file declares what a complete verification of that project is.
 It lives in the local, gitignored `config/verify/<project-name>`, keyed on the project directory's basename, and contains one `<step> = <command>` line per step, with `#` comments and blank lines ignored:

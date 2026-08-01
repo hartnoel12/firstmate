@@ -8,16 +8,24 @@
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
 # reachable from any remote-tracking branch (a fork counts as a remote, so
 # upstream-contribution PRs pushed to a fork satisfy this in any mode), OR - for a
-# normal ship task whose commits are not so reachable - when its PR is merged and
-# GitHub reports a PR head that contains the current local work, or its content is
-# already present in the up-to-date default branch. This recognizes the common
-# squash-merge-then-delete-branch flow, where the branch's own commits live nowhere
-# on a remote yet the change is fully in main.
+# normal ship task whose commits are not so reachable - when the forge reports a PR
+# head that contains the current local work, when its PR is merged and that head
+# contains the work, or when its content is already present in the up-to-date
+# default branch. This recognizes the common squash-merge-then-delete-branch flow,
+# where the branch's own commits live nowhere on a remote yet the change is fully
+# in main.
+# Local remote-tracking refs are a CACHE of where the work is, not the fact itself,
+# which is why the forge's PR head is consulted before refusing. Repointing origin
+# at a fork, pruning the ref when a head branch is deleted, or pushing from another
+# clone all empty that cache while the commits sit safely on the remote, and a
+# refusal there is a refusal of a captain's genuinely pushed branch.
 # The PR itself is resolved from the task's recorded pr= when present, or - when
 # no pr= was ever recorded (e.g. a yolo-authorized merge on a repo with no PR CI,
 # where the usual "checks green" fm-pr-check.sh trigger never fires) - by looking
-# up a merged PR whose head branch matches the worktree's branch, fetching its head
-# via refs/pull/<n>/head when the branch itself was deleted. So a missing pr= never
+# up a PR whose head branch matches the worktree's branch, fetching its head
+# via refs/pull/<n>/head when the branch itself was deleted. That fetch asks the
+# PR's OWN repository first and origin second, because a fork workflow leaves
+# origin pointing somewhere the PR does not live. So a missing pr= never
 # by itself causes a false refusal of landed work.
 # A gh lookup error falls back to the content check; if that is also inconclusive,
 # teardown refuses rather than risk discarding unlanded work.
@@ -130,6 +138,9 @@ if [ "$BACKEND" = orca ]; then
 fi
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
+# The PR pr_state_and_head last answered for, so its callers fetch from that PR
+# rather than re-deriving the target.
+TEARDOWN_PR_TARGET=
 # tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
 # (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
@@ -314,10 +325,34 @@ pr_number_from_target() {
   printf '%s' "$n"
 }
 
+# The repository the PR itself lives in, derived from the recorded pr= URL. In a
+# fork workflow `origin` points at the fork while the PR lives on the upstream
+# repository, so origin is simply the wrong place to ask for refs/pull/<n>/head.
+# Echoes nothing when the target is a bare number or a non-GitHub URL.
+pr_repository_url() {
+  local target=$1
+  case "$target" in
+    *://*) ;;
+    *) return 1 ;;
+  esac
+  fm_pr_url_parse "$target" >/dev/null 2>&1 || return 1
+  [ "$FM_PR_PROVIDER" = github ] || return 1
+  [ -n "$FM_PR_OWNER" ] && [ -n "$FM_PR_REPO" ] || return 1
+  printf 'https://github.com/%s/%s.git' "$FM_PR_OWNER" "$FM_PR_REPO"
+}
+
 ensure_commit_object() {
-  local target=$1 commit=$2 n
+  local target=$1 commit=$2 n url
   git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null && return 0
   n=$(pr_number_from_target "$target") || return 1
+  # The PR's own repository first, then origin. Trying origin alone is what
+  # breaks once origin has been repointed at a fork.
+  if url=$(pr_repository_url "$target"); then
+    if git -C "$WT" fetch --quiet "$url" "refs/pull/$n/head" >/dev/null 2>&1 \
+      && git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null; then
+      return 0
+    fi
+  fi
   git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
   git -C "$WT" fetch --quiet origin "refs/pull/$n/head" >/dev/null 2>&1 || return 1
   git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null
@@ -355,13 +390,12 @@ $unpushed
 EOF
 }
 
-# Is the worktree's PR merged for local work contained in that PR? Resolves the
-# PR from the recorded pr= URL first, then from the branch name, and asks GitHub
-# for both the PR state and head. Returns non-zero when the PR is not merged, the
-# current work is not contained in the PR head, no PR is found, or any gh error
-# occurs - the caller then falls back to the content check.
-pr_is_merged() {
-  local branch=$1 target view state head current
+# Ask the forge for this worktree's PR state and head, as "<state>\t<head>", and
+# leave the PR it answered for in TEARDOWN_PR_TARGET. Resolves the PR from the
+# recorded pr= URL first, then from the branch name. Non-zero on no PR or any gh
+# error, so every caller treats an unanswerable forge as "cannot establish".
+pr_state_and_head() {
+  local branch=$1 target view
   if [ -n "$PR_URL" ]; then
     target=$PR_URL
   else
@@ -369,18 +403,49 @@ pr_is_merged() {
   fi
   [ -n "$target" ] || return 1
   view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
+  [ "${view%%$'\t'*}" != "$view" ] || return 1
+  TEARDOWN_PR_TARGET=$target
+  printf '%s' "$view"
+}
+
+# Is the worktree's PR merged for local work contained in that PR? Returns
+# non-zero when the PR is not merged, the current work is not contained in the PR
+# head, no PR is found, or any gh error occurs - the caller then falls back to
+# the content check.
+pr_is_merged() {
+  local branch=$1 view state head current
+  view=$(pr_state_and_head "$branch") || return 1
   state=${view%%$'\t'*}
   head=${view#*$'\t'}
-  [ "$state" != "$view" ] || return 1
   case "$state" in
     MERGED|merged) ;;
     *) return 1 ;;
   esac
   [ -n "$head" ] || return 1
-  ensure_commit_object "$target" "$head" || return 1
+  ensure_commit_object "$TEARDOWN_PR_TARGET" "$head" || return 1
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
   git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
   unpushed_patches_are_in_pr_head "$head"
+}
+
+# Are this worktree's commits already on the forge, whatever the PR's state?
+#
+# `git log HEAD --not --remotes` consults only LOCAL remote-tracking refs, and
+# those are a cache of where the work is, not the fact itself. Repointing origin
+# at a fork, pruning the ref after a head branch is deleted, or pushing from
+# another clone each leave that cache empty while the commits sit safely on the
+# remote - and teardown then refuses genuinely pushed work as unlanded. Asking
+# the forge for the PR head answers the real question. Non-zero whenever the
+# answer cannot be established, so an unreachable forge still refuses rather
+# than guesses; this only ever turns a false refusal into an allow.
+work_is_on_pr_head() {
+  local branch=$1 view head current
+  view=$(pr_state_and_head "$branch") || return 1
+  head=${view#*$'\t'}
+  [ -n "$head" ] || return 1
+  ensure_commit_object "$TEARDOWN_PR_TARGET" "$head" || return 1
+  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
+  git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null
 }
 
 # Is the branch's content already present in the up-to-date default branch? Fetches
@@ -721,7 +786,7 @@ validate_worktree_teardown_safety() {
       branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
       TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=$branch
     fi
-    if ! work_is_landed "$branch"; then
+    if ! work_is_on_pr_head "$branch" && ! work_is_landed "$branch"; then
       echo "REFUSED: worktree $WT has work not on any remote and not landed." >&2
       printf 'unpushed commits:\n%s\n' "$unpushed" >&2
       echo "Push the branch, land its PR, or get the captain's explicit OK to discard, then --force." >&2

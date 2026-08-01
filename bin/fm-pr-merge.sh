@@ -136,7 +136,7 @@ if [ -z "$PR_HEAD" ]; then
   GATE_OK=1
 else
   GATE_OK=0
-  fm_verify_gate "$LEDGER" "$PR_HEAD" "$REQUIRED" || GATE_OK=1
+  fm_verify_gate "$LEDGER" "$PR_HEAD" "$REQUIRED" "$META" || GATE_OK=1
 fi
 
 if [ "$GATE_OK" -ne 0 ]; then
