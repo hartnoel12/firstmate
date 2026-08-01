@@ -55,7 +55,7 @@ A gate that cannot be satisfied exactly when it matters most is a gate agents ro
 
 ## Refusals observed firing
 
-Date: 2026-07-26.
+Date: 2026-07-26, re-recorded 2026-08-01 when the duplicate-run and bypass-recording cases were added.
 Command: `bash tests/fm-merge-verification.test.sh`.
 Each case constructs the failing situation against the real scripts and real git repositories, and asserts that nothing landed - local `main` did not move, or the forge CLI was never asked to merge - rather than asserting on message text.
 
@@ -82,9 +82,14 @@ ok - a second override with an identical commit and reason is still recorded and
 ok - an override reason containing a backslash is recorded verbatim and still merges
 ok - a declared step set that exists but is unusable refuses instead of silently requiring nothing
 ok - a declared step that reads stdin cannot swallow the steps after it
+ok - a commit carrying both a failed and a passing run of one step refuses in either order
+ok - two passing runs of the same commit still merge
+ok - steps passing across separate runs of one commit combine into one verification
+ok - a bypass is recorded in both durable homes, not just the ledger
+ok - a recorded bypass still refuses when the ledger loses, truncates, or corrupts it
 ```
 
-Six of those cases guard the gate's own record-keeping rather than a merge refusal, and each was watched failing against the pre-fix scripts before being encoded.
+Seven of those cases guard the gate's own record-keeping rather than a merge refusal, and each was watched failing against the pre-fix scripts before being encoded.
 The override's metadata note is inserted before the `pr=` line, because `bin/fm-pr-lib.sh` treats everything after `pr=` as post-recording injection and an override reason is operator free text.
 That rewrite checks every write and then proves the replacement is the original plus exactly the note line before it replaces anything, so a filesystem that fills partway through refuses the override instead of installing a plausible-looking truncation, and its temporary copy of the metadata is removed on signal as well as on every return path.
 
@@ -92,6 +97,43 @@ A guard that wrongly refuses is its own failure, because an override that will n
 Every comparison against the note is a whole-line shell string comparison, never a pattern, so a reason containing a backslash matches the line it was written from.
 A declared step set that exists but is unusable - a symlink, a directory - is refused rather than read as "this project declares nothing", which would silently drop the project from its own declared bar back to the floor.
 Declared steps are read into memory before any of them runs and each runs with stdin on `/dev/null`, so a step that drains stdin cannot consume the steps after it and leave a partial run recorded as a complete one.
+
+## Why one commit's runs resolve to the worst outcome
+
+Date: 2026-08-01.
+Observed on a fork PR: one commit carried both a failed and a passing run of the same check.
+The gate's original rule was that the last verify record bound to a commit wins, which resolved that pair in favour of the pass.
+
+Measured against the pre-fix library, with both records genuinely produced by `bin/fm-verify.sh` running `./fail.sh` and then `./pass.sh` at one commit:
+
+```
+5 failed run then passing re-run, same commit: MERGE ALLOWED
+6 passing run then failed re-run, same commit: refused
+```
+
+The asymmetry is the whole problem: the same two facts about the same tree resolved differently depending only on which ran last, so re-running was the cheapest way to turn a red result green.
+The rule is now that the worst outcome wins and is sticky, stated in full in `bin/fm-verify-lib.sh`'s PRECEDENCE note.
+Both orders now refuse, and `tests/fm-merge-verification.test.sh` exercises both plus its two controls: repeated passing runs still merge, and steps that pass across separate runs of one commit combine rather than superseding each other.
+
+## Why a bypass is recorded twice
+
+Every other rule the gate applies is checked against evidence the gate produced itself.
+Rule 4 is not: it depends on a record something else had to write, which makes losing that record the one failure the gate cannot see.
+Measured against the pre-fix library, with a well-formed bypass of a step that has no passing evidence:
+
+```
+bypass of an unverified step, well-formed     : refused
+same bypass, file lost its trailing newline   : MERGE ALLOWED
+same bypass, one byte of the kind corrupted   : MERGE ALLOWED
+```
+
+The trailing-newline case is `while read` dropping a final line with no terminator, which is exactly where a freshly appended bypass sits.
+The corrupted-kind case is the gate skipping any record it does not recognise as noise.
+
+Three changes close it, and each is now covered by a test watched failing against the pre-fix scripts.
+The ledger is parsed strictly: a line that is not exactly six TAB-separated fields, or whose kind is not `verify`, `bypass`, or `override`, refuses rather than being skipped.
+Fields are split without `IFS=$'\t' read`, because TAB is IFS whitespace and `read` folds a run of tabs into one separator, shifting every field after an empty one - which silently turned a bypass's `why` into its `what`.
+And a bypass is written to the task's metadata as well as the ledger, the same second home the override has always had, so losing or damaging either file still leaves the bypass visible.
 
 ## Scope of the guarantee
 

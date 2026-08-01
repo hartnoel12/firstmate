@@ -849,10 +849,13 @@ wedge_alarm_notify() {  # <summary> <marker>
     [ -n "$ch" ] || continue
     channels+=("$ch")
   done < <(wedge_alarm_configured_channels)
-  for ch in "${channels[@]}"; do
+  # Guarded expansions: an array that is initialised empty and appended to
+  # conditionally is an unbound-variable error under `set -u` on Bash 3.2, the
+  # system Bash on the macOS half of this fleet.
+  for ch in "${channels[@]+"${channels[@]}"}"; do
     [ "$ch" = off ] && return 0
   done
-  for ch in "${channels[@]}"; do
+  for ch in "${channels[@]+"${channels[@]}"}"; do
     case "$ch" in auto|default) ch=$(wedge_alarm_platform_default) ;; esac
     case "$ch" in
       '') log "wedge alarm: no OS-level alert channel on $(uname); durable marker $marker is the only signal - set config/wedge-alarm (e.g. a command: directive)" ;;
@@ -1417,7 +1420,7 @@ fm_super_main() {
       [ -n "$t" ] && [ $((now - t)) -lt "$CRASH_WINDOW" ] && keep+=("$t")
     done
     keep+=("$now")
-    crash_times=("${keep[@]}")
+    crash_times=("${keep[@]+"${keep[@]}"}")
     if [ "${#crash_times[@]}" -gt "$CRASH_THRESHOLD" ]; then
       log "ERROR: watcher crashed ${#crash_times[@]} times within ${CRASH_WINDOW}s; backing off ${CRASH_BACKOFF}s"
       crash_times=()

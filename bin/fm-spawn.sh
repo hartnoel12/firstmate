@@ -1297,7 +1297,47 @@ exclude_path() {
   mkdir -p "$(dirname "$EXCL")"
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
 }
+# Worktree-resident hook files firstmate owns, in the order they are scrubbed.
+TURNEND_WORKTREE_ARTIFACTS='.claude/settings.local.json
+.opencode/plugins/fm-turn-end.js
+.fm-grok-turnend
+.fm-kimi-turnend'
+
+# A pooled worktree slot outlives the task that occupied it, and so does that
+# task's turn-end hook: still on disk, still naming a state/<id>.turn-ended for
+# a task that no longer exists. Any harness that reads the file fires it for the
+# dead task, and the harnesses do not each read only their own - grok loads
+# <worktree>/.claude/settings.local.json as a project hook, so a claude crew's
+# leftover hook wakes firstmate for a finished task from under a grok crew.
+# Teardown removes these, but teardown is not the only way a slot comes back
+# (a forced reclaim, an abandoned task, a task whose teardown never ran), so
+# spawn scrubs them as well: it is the one step every new occupant runs, which
+# makes the cleanup converge rather than depend on the previous task exiting
+# tidily. Only firstmate's own artifacts are removed, and only while git is not
+# tracking them, so a project's committed file is reported rather than deleted.
+scrub_stale_turnend_hooks() {
+  local rel
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    [ -f "$WT/$rel" ] || continue
+    # .claude/settings.local.json is the one shared name here: a project may own
+    # one that has nothing to do with firstmate. Only a file naming a turn-end
+    # signal is firstmate's to remove.
+    if [ "$rel" = '.claude/settings.local.json' ] \
+      && ! grep -q '\.turn-ended' "$WT/$rel" 2>/dev/null; then
+      continue
+    fi
+    if git -C "$WT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+      echo "warning: $WT/$rel is committed to the project and holds a firstmate turn-end hook; leaving it in place - it will keep signalling for whichever task it names until the project drops it" >&2
+      continue
+    fi
+    rm -f "$WT/$rel"
+  done <<EOF
+$TURNEND_WORKTREE_ARTIFACTS
+EOF
+}
 if [ "$KIND" != secondmate ]; then
+  scrub_stale_turnend_hooks
   case "$HARNESS" in
     claude*)
       mkdir -p "$WT/.claude"

@@ -105,7 +105,7 @@ CONFIG_FILE=$(fm_verify_config_path "$CONFIG" "$PROJ")
 REQUIRED=$(fm_verify_required_steps "$CONFIG_FILE") || exit 1
 
 GATE_OK=0
-fm_verify_gate "$LEDGER" "$TIP" "$REQUIRED" || GATE_OK=1
+fm_verify_gate "$LEDGER" "$TIP" "$REQUIRED" "$META" || GATE_OK=1
 
 if [ "$GATE_OK" -ne 0 ]; then
   if [ "$OVERRIDE" -ne 1 ]; then

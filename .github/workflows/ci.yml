@@ -304,12 +304,14 @@ jobs:
           path: ${{ runner.temp }}/fm-test/fm-test-timing-aggregate.json
           if-no-files-found: warn
 
-  # Stock macOS Bash 3.2 lane, covering two things: a parse sweep of every
-  # canonical shell root via bin/fm-bash-syntax-check.sh --require-bash32, which
-  # is the only lane that can catch Bash 3.2 parse hazards because every other
-  # lane runs Bash 5, plus the snapshot and Bearings consumer tests the job is
-  # named for. The display name deliberately stays as-is despite being narrower
-  # than the coverage, because required-status-check configuration references it.
+  # Stock macOS Bash 3.2 lane, covering three things: a parse sweep of every
+  # canonical shell root via bin/fm-bash-syntax-check.sh --require-bash32; the
+  # empty-array RUNTIME hazard via tests/fm-bash32-empty-array.test.sh; plus the
+  # snapshot and Bearings consumer tests the job is named for. The first two are
+  # here because every other lane runs Bash 5, which neither fails to parse the
+  # heredoc hazard nor errors on an empty array. The display name deliberately
+  # stays as-is despite being narrower than the coverage, because
+  # required-status-check configuration references it.
   macos-stock-bash:
     name: Stock macOS Bash snapshot compatibility
     runs-on: macos-latest
@@ -334,6 +336,22 @@ jobs:
           # makes the job fail rather than pass vacuously if this ever stops
           # being Bash 3.2.
           bin/fm-bash-syntax-check.sh --require-bash32
+
+          # The other Bash 3.2 hazard, and the only lane that can RUN it: an
+          # empty array expanded under `set -u` is fatal on 3.2 and silent on
+          # Bash 5, so the Linux lanes cannot see it either
+          # (docs/verification/bash32-empty-array.md).
+          bash32_output=$(/bin/bash tests/fm-bash32-empty-array.test.sh)
+          printf '%s\n' "$bash32_output"
+          if printf '%s\n' "$bash32_output" | grep -q '^skip:'; then
+            echo "::error::the Bash 3.2 empty-array runtime half did not run on the Bash 3.2 lane"
+            exit 1
+          fi
+          bash32_count=$(printf '%s\n' "$bash32_output" | grep -c '^ok - ')
+          [ "$bash32_count" -eq 4 ] || {
+            echo "::error::expected 4 Bash 3.2 empty-array tests, got $bash32_count"
+            exit 1
+          }
 
           snapshot_output=$(/bin/bash tests/fm-fleet-snapshot-view.test.sh)
           printf '%s\n' "$snapshot_output"

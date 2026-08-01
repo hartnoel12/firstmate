@@ -144,9 +144,22 @@ if [ "$ACTION" = bypass ]; then
     SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || printf '%s' '-')
     fm_verify_sha_valid "$SHA" || SHA='-'
   fi
-  fm_verify_append "$LEDGER" bypass "$SHA" "$BY_STEPS" "$BY_WHY" "$BY_WHO" \
-    || die "could not record the bypass"
-  printf 'recorded bypass of %s for %s (%s)\n' "$BY_STEPS" "$ID" "$BY_WHY"
+  # bin/fm-verify-lib.sh owns why a bypass is written twice and what the gate
+  # does with each copy; a partial write is reported as exactly that, because the
+  # ledger half it did land keeps refusing the merge.
+  BY_RC=0
+  fm_verify_record_bypass "$LEDGER" "$META" "$SHA" "$BY_STEPS" "$BY_WHY" "$BY_WHO" || BY_RC=$?
+  case "$BY_RC" in
+    0) ;;
+    2)
+      die "the bypass is recorded in the verification ledger but could not be copied into the task record at $META; the ledger record is deliberately kept, so merging $ID still refuses until those steps have passing evidence for the exact commit - repair the task record rather than recording the bypass again"
+      ;;
+    *)
+      die "could not append the bypass to the verification ledger; nothing was recorded as bypassed"
+      ;;
+  esac
+  printf 'recorded bypass of %s for %s (%s), in both the ledger and the task record\n' \
+    "$BY_STEPS" "$ID" "$BY_WHY"
   printf 'Merging %s now refuses until those steps have passing evidence for the\n' "$ID"
   printf 'exact commit, or the merge is explicitly overridden.\n'
   exit 0

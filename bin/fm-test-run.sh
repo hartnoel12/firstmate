@@ -128,6 +128,7 @@ family_for_basename() {
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|fm-stow-contract.test.sh|\
     fm-subagent-pretool-check.test.sh|\
     fm-supervision-instructions.test.sh|fm-tmux-submit-busy.test.sh|fm-transition-lib.test.sh|\
+    fm-bash32-empty-array.test.sh|\
     fm-test-run.test.sh|fm-test-isolation-proof.test.sh)
       printf '%s\n' pure-contract-unit
       ;;
@@ -162,7 +163,8 @@ family_for_basename() {
       ;;
     fm-backend-herdr.test.sh|fm-backend-tmux-smoke.test.sh|fm-backend.test.sh|\
     fm-herdr-session-cleanup.test.sh|fm-send-strict.test.sh|fm-spawn-batch.test.sh|\
-    fm-spawn-dispatch-profile.test.sh|fm-spawn-worktree-settle.test.sh)
+    fm-spawn-dispatch-profile.test.sh|fm-spawn-turnend-hook.test.sh|\
+    fm-spawn-worktree-settle.test.sh)
       printf '%s\n' backend-dispatch
       ;;
     fm-merge-verification.test.sh|fm-pr-check-security.test.sh|fm-pr-merge.test.sh|\
