@@ -141,13 +141,25 @@ test_ship_project_memory_wording() {
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "brief was not scaffolded"
-  assert_grep "Record only project knowledge useful to almost every future session." "$brief" \
-    "project-memory contract lost the durable-knowledge bar"
-  assert_grep "prefer a pointer to the authoritative file, command, or doc over copying the detail" "$brief" \
-    "project-memory contract lost pointer-over-copy guidance"
+  assert_grep "The DEFAULT destination is a skill" "$brief" \
+    "project-memory contract lost the skill-default routing rule"
+  assert_grep "reserved for the short list every session needs regardless of task" "$brief" \
+    "project-memory contract lost the AGENTS.md index-only scope"
+  assert_grep "keep \`AGENTS.md\` under roughly 200 lines" "$brief" \
+    "project-memory contract lost the AGENTS.md size budget"
+  assert_grep "trigger-quality frontmatter" "$brief" \
+    "project-memory contract lost the trigger-quality frontmatter requirement"
+  assert_grep '"Use when"' "$brief" \
+    "project-memory contract lost the explicit Use-when requirement"
+  assert_grep "explicit \"Triggers:\" phrases and code-touch events" "$brief" \
+    "project-memory contract lost the explicit Triggers requirement"
+  assert_grep "A skill that never fires is worse than a bloated memory file" "$brief" \
+    "project-memory contract lost the why-triggers-matter rationale"
+  assert_grep "\`savory-spec\` in savory-mvp is a good model to follow." "$brief" \
+    "project-memory contract lost the savory-spec example"
   assert_grep "lacks \`## Maintaining this file\`, add that short self-governance section" "$brief" \
     "project-memory contract lost the self-governance add-in-same-pass rule"
-  pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
+  pass "fm-brief.sh: ship project-memory wording defaults durable knowledge to a skill"
 }
 
 test_herdr_lab_contract_is_explicit_and_complete() {

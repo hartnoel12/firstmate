@@ -245,6 +245,9 @@ Classify the deliverable:
 - **Ship** is the default and produces a project change through the selected delivery mode; once implementation is authorized, dispatch a ship and keep any remaining bounded research inside it unless unresolved uncertainty could materially change whether or what to build.
 - **Scout** produces knowledge in `data/<id>/report.md`, never a PR, and is appropriate for investigation, diagnosis, planning, reproduction, or audit work when the captain explicitly requests a separate knowledge or design deliverable or unresolved uncertainty could materially change whether or what to build.
 
+Default a ship to one pull request per coherent area of work, not one per finding, since each validation run costs hundreds of model requests regardless of diff size; batch findings from the same area into that one run rather than opening one PR per finding.
+Keep finding-level granularity only for a sign-in or auth render path where a mistake is a total outage, a migration paired with a behavior change where revert granularity genuinely matters, a security fix that needs its own tests, or a captain decision outstanding on one half that would otherwise hold shipped value hostage; batching still means fewer, larger, coherent pull requests, never a grab-bag.
+
 If established evidence already answers an informational question, relay it without a design-only scout; when implementation intent is unclear, answer and ask one concise implementation question when useful rather than dispatching speculative design work.
 Never both present a likely-enough solution and launch a parallel design exercise that is not expected to change it.
 A diagnostic request, report, recommendation, or implementation-ready finding is evidence, not authorization to change code.
