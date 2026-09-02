@@ -55,7 +55,7 @@ A gate that cannot be satisfied exactly when it matters most is a gate agents ro
 
 ## Refusals observed firing
 
-Date: 2026-07-26, re-recorded 2026-08-01 when the duplicate-run and bypass-recording cases were added.
+Date: 2026-07-26, re-recorded 2026-08-01 when the duplicate-run and bypass-recording cases were added, and 2026-09-02 when the gitignored-cache refusal case was added.
 Command: `bash tests/fm-merge-verification.test.sh`.
 Each case constructs the failing situation against the real scripts and real git repositories, and asserts that nothing landed - local `main` did not move, or the forge CLI was never asked to merge - rather than asserting on message text.
 
@@ -74,6 +74,7 @@ ok - a genuinely verified commit merges on both paths with no new friction
 ok - the override refuses without its acknowledgement or with a thin reason
 ok - the override merges, announces loudly on both streams, and records durably
 ok - fm-verify.sh refuses to record evidence for a dirty worktree
+ok - fm-verify.sh refuses to record evidence for a worktree carrying gitignored cache
 ok - PR merge refuses when the forge cannot report the head commit to bind evidence to
 ok - a returned worktree still resolves the PR head, so evidence is not lost to cleanup
 ok - the override's metadata note leaves the task's PR metadata and armed poll intact

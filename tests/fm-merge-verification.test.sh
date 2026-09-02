@@ -25,7 +25,8 @@
 #   (k) the override refuses without its acknowledgement or with a thin reason
 #   (l) the override merges, announces loudly, and records durably in both the
 #       ledger and the task metadata
-#   (m) fm-verify.sh refuses to record evidence for a dirty worktree
+#   (m) fm-verify.sh refuses to record evidence for a dirty worktree, and
+#       separately refuses a worktree carrying gitignored untracked content
 #   (n) the PR head is the anchor, and a head the forge cannot report refuses
 #   (o) a returned worktree does not turn the honest path into an override
 #   (p) the override's metadata note leaves the task's PR metadata parseable;
@@ -478,6 +479,28 @@ test_verify_refuses_dirty_worktree() {
   pass "fm-verify.sh refuses to record evidence for a dirty worktree"
 }
 
+# A gitignored leftover (a build cache a prior occupant of a reused pooled
+# worktree could have left behind) is invisible to plain `git status`, so it
+# is not "dirty" - it must be refused by its own check, separate from (m).
+test_verify_refuses_gitignored_cache() {
+  local case_dir
+  case_dir=$(make_case ignored-cache local-only)
+  printf 'cache/\n' > "$case_dir/wt/.gitignore"
+  git -C "$case_dir/wt" add .gitignore
+  git -C "$case_dir/wt" commit -qm "ignore cache dir"
+  mkdir -p "$case_dir/wt/cache"
+  printf 'stale build output from a different commit\n' > "$case_dir/wt/cache/artifact"
+
+  run "$case_dir" verify "$VERIFY" run task-x1 --step test -- ./pass.sh
+
+  expect_code 1 "$RC" "ignored-cache: fm-verify.sh should refuse to record"
+  assert_grep 'gitignored untracked content' "$case_dir/verify.err" \
+    "ignored-cache: refusal did not name the ignored content"
+  assert_absent "$case_dir/state/task-x1.verification" \
+    "ignored-cache: evidence was recorded for a tree carrying stale ignored content"
+  pass "fm-verify.sh refuses to record evidence for a worktree carrying gitignored cache"
+}
+
 # --- (n) the PR head is the anchor, and an unknown head refuses -------------
 
 test_pr_refuses_unknown_head() {
@@ -845,6 +868,7 @@ test_verified_commit_merges_on_both_paths
 test_override_refuses_without_both_halves
 test_override_is_loud_and_durable
 test_verify_refuses_dirty_worktree
+test_verify_refuses_gitignored_cache
 test_pr_refuses_unknown_head
 test_pr_resolves_head_after_worktree_returned
 test_override_note_keeps_pr_metadata_parseable
