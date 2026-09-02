@@ -121,6 +121,7 @@ Forge checks remain welcome corroboration and are never the requirement.
 
 Evidence is produced by `bin/fm-verify.sh`, which runs the verification commands itself in the task's worktree and records the real exit codes against the exact commit; it cannot record a claim.
 The per-task ledger lives in `state/<id>.verification`, and an authorized bypass is recorded in the task's own metadata as well, so losing or damaging either file cannot hide it.
+Each recorded run also carries a digest of the worktree's gitignored untracked content (path count and a hash of the sorted top-level ignored paths) alongside the step results, because a reused pooled worktree can carry gitignored content - a build cache, installed dependencies, a local env file - that `git status` never reports as dirty. That content is never refused or deleted, since firstmate cannot tell a stale leftover apart from something a declared step legitimately needs; the digest just lets a later reader see whether two runs of the same commit saw the same ignored-tree state.
 When one commit carries more than one run of the same step, the worst outcome wins and is sticky.
 `bin/fm-verify-lib.sh` is the single owner of both records' format, the four gate rules, that precedence rule and the reasoning behind it, the bypass record, and the override.
 

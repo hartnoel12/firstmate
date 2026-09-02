@@ -755,6 +755,43 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
+# A fleet large enough to blow past the OS argument-list limit (ARG_MAX, and
+# the smaller per-argument MAX_ARG_STRLEN on Linux) once the aggregated task
+# JSON was passed to jq on argv, previously failing exec with "jq: Argument
+# list too long" from inside main_inventory_json's `jq -n --argjson tasks`.
+# The fixture pads one meta field per task so the aggregate stays comfortably
+# above the platform's own reported ARG_MAX while keeping the task count -
+# and so the number of real subprocess forks the snapshot does per task - as
+# low as the size target allows, since that dominates the test's runtime.
+test_large_fleet_snapshot_survives_arg_max() {
+  local home arg_max target pad_len pad n i id out task_count
+  home=$(make_home large-fleet)
+  arg_max=$(getconf ARG_MAX 2>/dev/null || echo 2097152)
+  target=$((arg_max * 2))
+  pad_len=40000
+  pad=$(head -c "$pad_len" /dev/zero | tr '\0' 'p')
+  n=$(((target + pad_len - 1) / pad_len))
+  for i in $(seq 1 "$n"); do
+    id=$(printf 'task-%05d' "$i")
+    fm_write_meta "$home/state/$id.meta" \
+      "kind=ship" \
+      "harness=codex" \
+      "mode=ship" \
+      "yolo=off" \
+      "project=alpha-$pad" \
+      "worktree=$home/projects/$id"
+    printf 'done: finished %s\n' "$id" > "$home/state/$id.status"
+  done
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json) \
+    || fail "large-fleet-snapshot: fm-fleet-snapshot.sh must not fail exec on a $n-task fleet"
+  task_count=$(printf '%s' "$out" | jq '.tasks | length')
+  [ "$task_count" = "$n" ] \
+    || fail "large-fleet-snapshot: expected $n tasks in the snapshot, got $task_count"
+  printf '%s' "$out" | jq -e '.schema == "fm-fleet-snapshot.v1" and .main_inventory.valid == true' \
+    >/dev/null || fail "large-fleet-snapshot: snapshot schema or main_inventory wrong: $out"
+  pass "fm-fleet-snapshot.sh completes on a fleet sized past this platform's ARG_MAX"
+}
+
 test_empty_fleet_json
 test_fixture_snapshot_json
 test_main_inventory_orphan_and_unstructured_disclosure
@@ -770,3 +807,4 @@ test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
+test_large_fleet_snapshot_survives_arg_max

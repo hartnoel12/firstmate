@@ -31,6 +31,11 @@
 #            bypass, which can never be superseded by evidence)
 #   outcome  passed | failed - derived from real exit codes, never asserted
 #   steps    name:passed,name:failed,... in the order they ran
+#   note     for a verify record, `ignored=<count>:<digest>` - bin/fm-verify.sh
+#            owns this: a stable digest of the worktree's gitignored untracked
+#            paths at run time, so a later reader can tell whether two runs of
+#            the same commit saw the same ignored-tree state. This gate never
+#            reads or judges it; ignored content is recorded, never refused.
 #   what     comma-separated bypassed step names, or '*' for "the whole run"
 #
 # THE GATE (fm_verify_gate) refuses unless ALL of these hold for the exact
