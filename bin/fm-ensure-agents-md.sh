@@ -7,6 +7,10 @@
 # Owns the canonical "## Maintaining this file" self-governance wording for
 # project AGENTS.md files, injecting it idempotently into created skeletons,
 # promoted CLAUDE.md files, and any existing AGENTS.md that still lacks it.
+# Also warns (advisory, never fatal) when the resulting AGENTS.md exceeds
+# AGENTS_MD_LINE_BUDGET lines, naming the file, its size, the budget, and the
+# skill-routing fix, so the file cannot silently regrow past what every
+# session pays for on every turn.
 # Refuses a case-variant real memory file such as a lowercase agents.md, whose
 # CLAUDE.md symlink would carry an uppercase literal target that dangles on a
 # case-sensitive filesystem (issue #389).
@@ -34,6 +38,20 @@ cd "$DIR"
 
 AGENTS=AGENTS.md
 CLAUDE=CLAUDE.md
+AGENTS_MD_LINE_BUDGET=200
+
+# Advisory only: never affects the exit code. AGENTS.md loads on every turn of
+# every session, so a project that lets it grow unbounded pays that cost
+# forever. Point the crewmate at the skill-routing fix instead of letting it
+# regrow past budget unnoticed.
+check_size() {
+  [ -f "$AGENTS" ] || return 0
+  local lines
+  lines=$(wc -l < "$AGENTS")
+  if [ "$lines" -gt "$AGENTS_MD_LINE_BUDGET" ]; then
+    echo "warning: $DIR/$AGENTS is $lines lines, over the $AGENTS_MD_LINE_BUDGET-line budget; route new durable knowledge to a project skill (for example .claude/skills/<name>/SKILL.md) instead of appending here" >&2
+  fi
+}
 
 write_maintenance_section() {
   cat <<'EOF'
@@ -148,6 +166,7 @@ if [ -e "$AGENTS" ]; then
       else
         echo "unchanged: AGENTS.md with CLAUDE.md -> AGENTS.md in $DIR"
       fi
+      check_size
       exit 0
     fi
     echo "conflict: CLAUDE.md is a symlink in $DIR but does not point to AGENTS.md" >&2
@@ -161,6 +180,7 @@ if [ -e "$AGENTS" ]; then
     else
       echo "symlinked: CLAUDE.md -> AGENTS.md in $DIR"
     fi
+    check_size
     exit 0
   fi
   if [ -f "$CLAUDE" ]; then
@@ -187,6 +207,7 @@ if [ -e "$CLAUDE" ]; then
     ensure_maintenance_section
     ln -s "$AGENTS" "$CLAUDE"
     echo "promoted: moved CLAUDE.md to AGENTS.md and symlinked CLAUDE.md -> AGENTS.md in $DIR"
+    check_size
     exit 0
   fi
   echo "conflict: CLAUDE.md exists in $DIR but is not a regular file or symlink" >&2

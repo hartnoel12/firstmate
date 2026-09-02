@@ -39,11 +39,11 @@
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
 # "blocked:": pause for a known external wait expected to clear on its own,
 # blocked when firstmate must act.
-# Ship tasks include a project-memory section so durable project-intrinsic
-# learnings can be committed to AGENTS.md through the project's delivery path;
-# it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
-# over copied detail) and has the crewmate add the fm-ensure-agents-md.sh
-# self-governance section when a touched project AGENTS.md lacks it.
+# Ship tasks include a project-memory section defaulting durable project-intrinsic
+# learnings to a project skill, not AGENTS.md; AGENTS.md gets only a short index
+# entry, stays under a line budget, and has the crewmate add the
+# fm-ensure-agents-md.sh self-governance section when a touched project
+# AGENTS.md lacks it.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -395,11 +395,16 @@ $RULE1
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
 
 # Project memory
-If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
-Record only project knowledge useful to almost every future session.
-For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
+If this task produced durable project-intrinsic knowledge, route it to a skill first, \`AGENTS.md\` only for the rest.
+The DEFAULT destination is a skill: create or extend one under the project's skills directory (for example a Claude-Code-style \`.claude/skills/<name>/SKILL.md\`, matching whatever convention the project already uses).
+\`AGENTS.md\` is reserved for the short list every session needs regardless of task; add durable detail there only as a one-line index entry pointing at the skill or doc that holds it, never the detail itself.
+If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or you are adding an index entry or creating a project skill, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
+Budget: keep \`AGENTS.md\` under roughly 200 lines. If your addition would push it past that, that is the signal the knowledge belongs in a skill, not a reason to write more tersely.
+Every new skill needs trigger-quality frontmatter: a \`description\` saying what it covers, an explicit "Use when" list of situations, and explicit "Triggers:" phrases and code-touch events that would make an agent load it.
+A skill that never fires is worse than a bloated memory file: the knowledge silently stops being applied and nobody notices until something breaks.
+\`savory-spec\` in savory-mvp is a good model to follow.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
-Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+Keep it proportionate: skip this section entirely for trivial tasks that produced no durable project knowledge.
 
 $DOD
 EOF

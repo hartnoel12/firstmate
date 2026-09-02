@@ -200,6 +200,46 @@ test_lowercase_agents_md_refuses_case_fragile_symlink() {
   pass "fm-ensure-agents-md.sh: refuses a case-variant lowercase agents.md (issue #389)"
 }
 
+test_oversized_agents_md_warns_but_stays_advisory() {
+  local repo agents out rc i
+  repo="$TMP_ROOT/oversized-project"
+  mkdir -p "$repo"
+  {
+    echo "# Existing agent memory"
+    echo
+    i=1
+    while [ "$i" -le 210 ]; do
+      echo "Line $i of durable knowledge that should have gone in a skill instead."
+      i=$((i + 1))
+    done
+  } > "$repo/AGENTS.md"
+  ln -s AGENTS.md "$repo/CLAUDE.md"
+  agents="$repo/AGENTS.md"
+  out=$("$ROOT/bin/fm-ensure-agents-md.sh" "$repo" 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "an over-budget AGENTS.md must not fail the script (advisory only), got exit $rc"
+  assert_contains "$out" "warning:" "over-budget AGENTS.md did not print a warning"
+  assert_contains "$out" "$agents" "size warning did not name the file"
+  assert_contains "$out" "200-line budget" "size warning did not name the budget"
+  assert_contains "$out" "route new durable knowledge to a project skill" "size warning did not point at the skill destination"
+  pass "fm-ensure-agents-md.sh: warns (advisory) when AGENTS.md is over the line budget"
+}
+
+test_undersized_agents_md_prints_no_size_warning() {
+  local repo agents out
+  repo="$TMP_ROOT/undersized-project"
+  mkdir -p "$repo"
+  printf '# Existing agent memory\n\nRun tests with make test.\n' > "$repo/AGENTS.md"
+  ln -s AGENTS.md "$repo/CLAUDE.md"
+  agents="$repo/AGENTS.md"
+  out=$("$ROOT/bin/fm-ensure-agents-md.sh" "$repo" 2>&1) || fail "fm-ensure-agents-md.sh failed for a small AGENTS.md"
+  assert_no_grep "warning:" "$agents" "unrelated: sanity check the AGENTS.md content itself has no warning text"
+  case "$out" in
+    *warning:*) fail "a small AGENTS.md ($agents) should not print a size warning: $out" ;;
+  esac
+  pass "fm-ensure-agents-md.sh: prints no size warning under the line budget"
+}
+
 test_created_agents_md_includes_self_governance
 test_promoted_claude_md_includes_self_governance
 test_promoted_claude_md_without_trailing_newline_keeps_blank_separator
@@ -209,3 +249,5 @@ test_existing_agents_md_with_section_reports_unchanged
 test_existing_crlf_agents_md_with_section_stays_unchanged
 test_existing_crlf_agents_md_without_section_preserves_crlf
 test_lowercase_agents_md_refuses_case_fragile_symlink
+test_oversized_agents_md_warns_but_stays_advisory
+test_undersized_agents_md_prints_no_size_warning
