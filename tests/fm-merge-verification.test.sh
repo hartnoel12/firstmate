@@ -26,7 +26,9 @@
 #   (l) the override merges, announces loudly, and records durably in both the
 #       ledger and the task metadata
 #   (m) fm-verify.sh refuses to record evidence for a dirty worktree, and
-#       separately refuses a worktree carrying gitignored untracked content
+#       separately records (rather than refuses) a worktree carrying
+#       gitignored untracked content, with a digest of that content alongside
+#       the result
 #   (n) the PR head is the anchor, and a head the forge cannot report refuses
 #   (o) a returned worktree does not turn the honest path into an override
 #   (p) the override's metadata note leaves the task's PR metadata parseable;
@@ -481,24 +483,31 @@ test_verify_refuses_dirty_worktree() {
 
 # A gitignored leftover (a build cache a prior occupant of a reused pooled
 # worktree could have left behind) is invisible to plain `git status`, so it
-# is not "dirty" - it must be refused by its own check, separate from (m).
-test_verify_refuses_gitignored_cache() {
-  local case_dir
+# is not "dirty" - but it is also indistinguishable from this task's own
+# legitimate build output (installed dependencies, a local .env), so it must
+# not refuse the run the way (m)'s dirty-worktree check does. It records a
+# digest of the ignored-path state alongside the result instead.
+test_verify_records_gitignored_cache() {
+  local case_dir sha
   case_dir=$(make_case ignored-cache local-only)
   printf 'cache/\n' > "$case_dir/wt/.gitignore"
   git -C "$case_dir/wt" add .gitignore
   git -C "$case_dir/wt" commit -qm "ignore cache dir"
   mkdir -p "$case_dir/wt/cache"
   printf 'stale build output from a different commit\n' > "$case_dir/wt/cache/artifact"
+  sha=$(tip "$case_dir")
 
   run "$case_dir" verify "$VERIFY" run task-x1 --step test -- ./pass.sh
 
-  expect_code 1 "$RC" "ignored-cache: fm-verify.sh should refuse to record"
-  assert_grep 'gitignored untracked content' "$case_dir/verify.err" \
-    "ignored-cache: refusal did not name the ignored content"
-  assert_absent "$case_dir/state/task-x1.verification" \
-    "ignored-cache: evidence was recorded for a tree carrying stale ignored content"
-  pass "fm-verify.sh refuses to record evidence for a worktree carrying gitignored cache"
+  expect_code 0 "$RC" "ignored-cache: fm-verify.sh should record evidence, not refuse"
+  assert_grep 'ignored=1:' "$case_dir/state/task-x1.verification" \
+    "ignored-cache: ledger did not record the ignored-path count and digest"
+
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  expect_code 0 "$RC" "ignored-cache: merge should succeed on the recorded evidence"
+  [ "$(main_of "$case_dir")" = "$sha" ] \
+    || fail "ignored-cache: local main did not move to the verified commit"
+  pass "fm-verify.sh records evidence (with an ignored-path digest) for a worktree carrying gitignored cache, rather than refusing"
 }
 
 # --- (n) the PR head is the anchor, and an unknown head refuses -------------
@@ -868,7 +877,7 @@ test_verified_commit_merges_on_both_paths
 test_override_refuses_without_both_halves
 test_override_is_loud_and_durable
 test_verify_refuses_dirty_worktree
-test_verify_refuses_gitignored_cache
+test_verify_records_gitignored_cache
 test_pr_refuses_unknown_head
 test_pr_resolves_head_after_worktree_returned
 test_override_note_keeps_pr_metadata_parseable

@@ -21,11 +21,18 @@
 # With no declaration the gate still requires a passing run bound to the exact
 # commit, which is the floor, not the ceiling.
 #
-# `run` refuses a dirty worktree, refuses a worktree carrying gitignored
-# untracked content (a build cache a prior occupant of a reused worktree could
-# have left behind, invisible to `git status` because ignored files are never
-# "dirty"), and refuses to record if HEAD moved while the commands were
-# running. Evidence that does not describe a known tree state is not evidence.
+# `run` refuses a dirty worktree and refuses to record if HEAD moved while the
+# commands were running. Evidence that does not describe a known tree state is
+# not evidence.
+#
+# Gitignored untracked content (a build cache a prior occupant of a reused
+# worktree could have left behind, invisible to `git status` because ignored
+# files are never "dirty") is not refused: pooled task worktrees legitimately
+# carry ignored content a declared step needs (installed dependencies, local
+# env files), and git cannot tell that apart from a stale leftover. Instead a
+# deterministic digest of the ignored-path state is recorded alongside the
+# result, so a later reader can tell whether two runs of the same commit saw
+# the same tree.
 #
 # `bypass` is the honest account of something firstmate authorized to be
 # skipped or waved through - a force-approved gate, a hook-disabled push, a
@@ -211,20 +218,28 @@ if [ -n "$(git -C "$WT" status --porcelain 2>/dev/null | head -1)" ]; then
 fi
 
 # Gitignored untracked content never shows up as "dirty" above, but a reused
-# pooled worktree can carry a stale build cache (node_modules, target/, a
-# coverage dir) from a prior occupant's different commit. Running the declared
-# commands against that leftover state can hide or invent a failure at random,
-# so refuse rather than silently record evidence for an unknown tree. The
-# operator resolves this deliberately (usually `git -C <worktree> clean -fdX`
-# to drop the ignored content, then reinstalling whatever the declared steps
-# need) rather than having firstmate itself delete build output it cannot tell
-# apart from something intentionally kept.
-IGNORED=$(git -C "$WT" status --porcelain --ignored 2>/dev/null | grep '^!! ' | head -3)
-if [ -n "$IGNORED" ]; then
-  die "worktree $WT carries gitignored untracked content that predates this run and could taint the result:
-$IGNORED
-Remove it first (for example: git -C \"$WT\" clean -ffdX) and reinstall whatever the verification steps need, so the evidence describes a known tree state."
+# pooled worktree can carry it from a prior occupant's different commit, or
+# just as legitimately from this task's own declared steps (node_modules for
+# `test = npm test`, a local .env). Git cannot tell those apart, and deleting
+# on a guess trades a hidden stale cache for a worse failure: destroying
+# dependencies or env files a declared step actually needs. So this is
+# recorded rather than refused: a stable digest of the sorted top-level
+# ignored paths, plus how many there are, rides along with the result, so a
+# later reader can tell whether two runs of the same commit saw the same
+# ignored-tree state.
+IGNORED_LIST=$(git -C "$WT" status --porcelain --ignored 2>/dev/null \
+  | grep '^!! ' | cut -c4- | LC_ALL=C sort)
+IGNORED_COUNT=0
+IGNORED_DIGEST=-
+if [ -n "$IGNORED_LIST" ]; then
+  IGNORED_COUNT=$(printf '%s\n' "$IGNORED_LIST" | grep -c .)
+  IGNORED_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-verify-ignored.XXXXXX") \
+    || die "cannot create a temp file to digest the worktree's ignored-path state"
+  printf '%s\n' "$IGNORED_LIST" > "$IGNORED_TMP"
+  IGNORED_DIGEST=$(fm_pr_sha256 "$IGNORED_TMP") || IGNORED_DIGEST=-
+  rm -f -- "$IGNORED_TMP"
 fi
+IGNORED_NOTE="ignored=$IGNORED_COUNT:$IGNORED_DIGEST"
 
 SHA_BEFORE=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || die "cannot read HEAD in $WT"
 fm_verify_sha_valid "$SHA_BEFORE" || die "cannot read a full commit id in $WT"
@@ -297,7 +312,7 @@ if [ "$SHA_AFTER" != "$SHA_BEFORE" ]; then
   die "HEAD moved from $SHA_BEFORE to $SHA_AFTER while verifying; nothing recorded, re-run against the final commit"
 fi
 
-fm_verify_append "$LEDGER" verify "$SHA_BEFORE" "$OUTCOME" "$RESULTS" "-" \
+fm_verify_append "$LEDGER" verify "$SHA_BEFORE" "$OUTCOME" "$RESULTS" "$IGNORED_NOTE" \
   || die "could not record the verification result"
 
 printf 'recorded %s for %s at %s (%s)\n' "$OUTCOME" "$ID" "$SHA_BEFORE" "$RESULTS"
