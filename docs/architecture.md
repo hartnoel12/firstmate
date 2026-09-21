@@ -18,9 +18,12 @@ A concurrent replacement remains armed, every non-merged or invalid observation 
 `bin/fm-pr-lib.sh` owns the receipt format and strict identity mechanics, while `bin/fm-watch.sh` owns queue-before-retirement ordering.
 No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crew is still working: an actively running no-mistakes step attributed to that crew's current code or a backend busy signature.
 A crew that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
-For an ordinary crew that has stopped, the normal-mode watcher first surfaces one stale wake, then applies that same cadence to an unchanged `paused:` or durable `captain-held` endpoint only when the backend confidently reports its agent dead.
-Live or inconclusive liveness remains fail-open at that initial surface, and the secondmate idle-endpoint exemption is unchanged.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
+Once firstmate has been shown a crew idle under its standing `paused:` or `captain-held` line, by that surfaced signal, a surfaced turn end, or one stale wake, the window is parked and the pause path alone owns its stale wakes.
+A parked window's idle pane churn never re-surfaces it, and its authoritative crew state is re-read only once per `FM_STALE_ESCALATE_SECS`, so an active run can still take over.
+A replaced status line or a busy pane ends the park and returns the window to ordinary stale detection, so a crew that resumes and then stops without a surfaced turn end is surfaced once.
+For an ordinary crew whose park firstmate has not been shown, the normal-mode watcher first surfaces one stale wake, then applies that same cadence; before that, an unchanged `paused:` or durable `captain-held` endpoint keeps the cadence without the surface only when the backend confidently reports its agent dead.
+Live or inconclusive liveness remains fail-open at that initial surface, and the secondmate idle-endpoint exemption is unchanged.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.
 No-change heartbeats are also benign.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.

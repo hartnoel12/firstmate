@@ -130,7 +130,8 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 # A crew that declared a pause is idling on a known external wait, so its stale
 # pane is absorbed rather than wedge-escalated.
 # A captain-held or paused crew whose agent has confidently exited uses the same
-# bounded cadence, while a live or ambiguously read agent still surfaces once.
+# bounded cadence, while a live or ambiguously read agent surfaces once unless
+# firstmate has already been shown its park (pause_is_parked).
 # These cases re-surface once for a recheck every PAUSE_RESURFACE_SECS - far
 # longer than the wedge threshold, but finite so a forgotten hold cannot rot invisibly.
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
@@ -281,19 +282,45 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
   esac
 }
 
+# The one derivation of a window's per-window state-file key (.hash-, .stale-,
+# .paused-, ...), shared by every reader and writer so they cannot disagree.
+window_state_key() {  # <window>
+  local key=$1
+  key=${key//:/_}
+  key=${key//\//_}
+  key=${key//./_}
+  printf '%s' "$key"
+}
+
+# A window is parked while it carries a live pause marker whose authoritative
+# recheck is younger than STALE_ESCALATE_SECS. The marker records that firstmate
+# has already been shown this crew idle under its standing paused: or
+# captain-held declaration, so until the declaration is replaced, the pane goes
+# busy, or the recheck falls due, its stale pane owes nothing but the long-cadence
+# recheck in handle_paused_stale.
+pause_is_parked() {  # <window>
+  local key
+  key=$(window_state_key "$1")
+  [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$STATE/.paused-rechecked-$key")" -lt "$STALE_ESCALATE_SECS" ]
+}
+
 # Absorb a stale pane under a declared external-wait pause (paused:) or a
 # dead-agent captain-held transfer, and re-surface it once every
-# PAUSE_RESURFACE_SECS for a recheck so it cannot rot invisibly. Called on any
-# stale poll once pause_state_class permits the bounded cadence, so it must be
-# cheap: it NEVER re-reads crew state. The re-surface age is anchored on the
-# status file mtime, not a per-hash marker, so a churny idle pane (a ticking
-# clock, a token counter) cannot keep resetting the cadence the way a hash-tied
-# timer would. A .paused-resurfaced-<key> throttle marker records the last
-# re-surface epoch so, once past the window, it fires once per window rather than
-# every poll. Advances the stale suppressor to <hash> and flags the key paused.
+# PAUSE_RESURFACE_SECS for a recheck so it cannot rot invisibly. This is the one
+# owner of every stale wake for a parked window. Called on any stale poll once
+# pause_state_class permits the bounded cadence, so it must be cheap: it NEVER
+# re-reads crew state. The re-surface age is anchored on the status file mtime,
+# not a per-hash marker, so a churny idle pane (a ticking clock, a token counter)
+# cannot keep resetting the cadence the way a hash-tied timer would. A
+# .paused-resurfaced-<key> throttle marker records the last re-surface epoch so,
+# once past the window, it fires once per window rather than every poll; it
+# outlives a busy spell under the same declaration so a monitor tick cannot
+# re-arm it. Advances the stale suppressor to <hash>, flags the key paused, and
+# logs the absorb once per parked hash rather than once per poll.
 handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason prev_h
+  key=$(window_state_key "$win")
+  prev_h=$(cat "$STATE/.stale-$key" 2>/dev/null || true)
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
@@ -309,34 +336,37 @@ handle_paused_stale() {  # <window> <task> <hash>
     date +%s > "$rf"
     wake "$reason"
   fi
-  triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
+  [ "$prev_h" = "$h" ] || triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
 }
 
+# Drop the park itself (marker and authoritative recheck) when a busy pane or an
+# authoritative verdict supersedes it. The re-surface throttle is left alone: it
+# belongs to the declaration and is dropped only when the declaration is replaced.
 clear_pause_state() {  # <window>
-  local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
-  rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
+  local key
+  key=$(window_state_key "$1")
+  rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key"
 }
 
 clear_pause_tracking() {  # <window>
-  local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
-  clear_pause_state "$win"
+  local key
+  key=$(window_state_key "$1")
+  clear_pause_state "$1"
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
 # Reconcile a declared pause or captain-held status with authoritative crew state.
-# Only a confidently dead ordinary crew may recover paused classification after
-# fm-crew-state has fallen back to stopped or unknown.
+# A parked window (pause_is_parked) stays paused without any read. Otherwise the
+# authoritative state is read once: an active run takes over as working, and a
+# declared pause that fm-crew-state still reports as paused keeps an existing
+# marker regardless of agent liveness, because that marker means firstmate was
+# already shown the park. With no marker, only a confidently dead ordinary crew
+# may recover paused classification after fm-crew-state has fallen back to
+# stopped or unknown, and a live or inconclusively read agent reports none so its
+# park surfaces once.
 pause_state_class() {  # <window> <task>
   local win=$1 task=$2 key last recheck_file class agent_alive
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(window_state_key "$win")
   last=$(last_status_line "$STATE/$task.status")
   recheck_file="$STATE/.paused-rechecked-$key"
   if ! status_is_paused_or_captain_held "$last"; then
@@ -344,15 +374,7 @@ pause_state_class() {  # <window> <task>
     crew_absorb_class "$task"
     return
   fi
-  if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
-    if [ "$(window_kind "$win")" != secondmate ]; then
-      agent_alive=$(fm_backend_agent_alive "$(window_backend "$win")" "$win" 2>/dev/null) || agent_alive=unknown
-      if [ "$agent_alive" != dead ]; then
-        rm -f "$recheck_file"
-        printf 'none'
-        return
-      fi
-    fi
+  if pause_is_parked "$win"; then
     printf 'paused'
     return
   fi
@@ -360,6 +382,11 @@ pause_state_class() {  # <window> <task>
   if [ "$class" = working ]; then
     rm -f "$recheck_file"
     printf 'working'
+    return
+  fi
+  if [ "$class" = paused ] && [ -e "$STATE/.paused-$key" ]; then
+    date +%s > "$recheck_file"
+    printf 'paused'
     return
   fi
   if [ "$(window_kind "$win")" != secondmate ]; then
@@ -378,9 +405,12 @@ pause_state_class() {  # <window> <task>
   printf '%s' "$class"
 }
 
+# The one immediate surface a live crew's park is owed when firstmate has not
+# been shown it yet. Under a still-standing pause or captain hold it records the
+# park, so the pause path owns every later stale wake for this window.
 surface_nonterminal_stale() {  # <window> <hash>
   local win=$1 h=$2 key task last
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(window_state_key "$win")
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
@@ -394,6 +424,29 @@ surface_nonterminal_stale() {  # <window> <hash>
     rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
   fi
   wake "stale: $win"
+}
+
+# A surfaced signal shows firstmate each listed crew's current status. A crew
+# whose last line still declares a pause or captain hold is therefore recorded
+# as shown, so its idle pane parks without a second, bare stale wake for the same
+# declaration. The recheck is left due, so the first stale sighting still
+# confirms the park against authoritative crew state. Not called under away
+# mode, where the daemon rather than firstmate triages the signal.
+mark_signalled_pauses_shown() {  # <signal-file> ...
+  local f task w
+  for f in "$@"; do
+    task=$(basename "$f")
+    case "$task" in
+      *.status) task=${task%.status} ;;
+      *.turn-ended) task=${task%.turn-ended} ;;
+      *) continue ;;
+    esac
+    status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" || continue
+    [ -e "$STATE/$task.meta" ] || continue
+    w=$(fm_backend_target_of_meta "$STATE/$task.meta")
+    [ -n "$w" ] || continue
+    : > "$STATE/.paused-$(window_state_key "$w")"
+  done
 }
 
 # Check and heartbeat cadence must survive actionable exits and restarts: the
@@ -812,6 +865,8 @@ EOF
       done <<EOF
 $pending
 EOF
+      # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
+      afk_present || mark_signalled_pauses_shown $files
       wake "$reason"
     else
       while IFS=$(printf '\t') read -r sf sig f; do
@@ -831,19 +886,18 @@ EOF
   while IFS= read -r w; do
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
-    key=${w//:/_}
-    key=${key//\//_}
-    key=${key//./_}
+    key=$(window_state_key "$w")
     last=$(last_status_line "$STATE/$task.status")
-    if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then
-      clear_pause_tracking "$w"
+    if ! status_is_paused_or_captain_held "$last"; then
+      # The declaration was replaced: drop the park and its re-surface throttle.
+      [ -e "$STATE/.paused-$key" ] && clear_pause_tracking "$w"
+      [ -e "$STATE/.paused-resurfaced-$key" ] && rm -f "$STATE/.paused-resurfaced-$key"
     fi
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
-    key=$(printf '%s' "$w" | tr ':/.' '___')
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
     sf="$STATE/.stale-$key"
@@ -851,6 +905,24 @@ EOF
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
     prev=$(cat "$hf" 2>/dev/null || true)
+    # A parked window belongs to the pause path alone. While pause_is_parked
+    # holds (the check above has already dropped any park whose declaration was
+    # replaced), an idle pane, changed or not, goes straight to
+    # handle_paused_stale: no other stale branch below can classify it or append
+    # a bare stale wake, and the steady-state poll skips every classification
+    # read. A busy pane still supersedes the pause below, away mode still hands
+    # the daemon every stale wake, and a due recheck falls through so
+    # pause_state_class can re-read authoritative state.
+    if pause_is_parked "$w" && ! afk_present && ! window_is_busy "$w" "$tail40"; then
+      if [ "$h" = "$prev" ]; then
+        echo $(( $(cat "$cf" 2>/dev/null || echo 0) + 1 )) > "$cf"
+      else
+        printf '%s' "$h" > "$hf"
+        echo 0 > "$cf"
+      fi
+      handle_paused_stale "$w" "$task" "$h"
+      continue
+    fi
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$cf"

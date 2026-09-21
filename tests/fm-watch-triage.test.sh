@@ -958,6 +958,245 @@ test_paused_authoritative_working_preserves_wedge_timer() {
   pass "a paused status overridden by authoritative working preserves its wedge timer and escalates"
 }
 
+# --- a live crew parked under a declared pause stays parked -----------------
+# A live agent that declared paused: idles on a pane whose content can still
+# churn (a footer, a context meter, a monitor line) and may take short turns
+# when its own monitor fires. Once firstmate has been shown that park, by the
+# pause's surfaced status signal or by the one immediate stale surface for a
+# park it never saw, the live pause marker makes the long-cadence recheck the
+# only stale wake owed. A busy pane still supersedes the pause, so a crew that
+# resumes and then stops without any surfaced turn end is seen again once.
+
+PARKED_STATUS='paused: no-mistakes run in flight, monitor armed for first gate'
+PARKED_CREW_STATE='state: paused · source: status-log · no-mistakes run in flight, monitor armed for first gate'
+PARKED_IDLE='❯ parked at the gate · footer tick 0'
+PARKED_BUSY='✻ Checking the gate… (3s · esc to interrupt)'
+
+backdate() {  # <file> <seconds-ago>
+  local back
+  back=$(( $(date +%s) - $2 ))
+  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$1"
+  else touch -m -d "@$back" "$1"; fi
+}
+
+# The live Claude crew fixture every parked-crew case shares: its metadata, a
+# declared pause backdated by <status-age-secs>, and an idle pane.
+make_parked_live_crew() {  # <dir> <window> <task> <status-age-secs>
+  local dir=$1 window=$2 task=$3 status_age=$4 statusf
+  statusf="$dir/state/$task.status"
+  printf '%s\n' "$PARKED_IDLE" > "$dir/pane.txt"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=tmux\n' "$window" > "$dir/state/$task.meta"
+  printf '%s\n' "$PARKED_STATUS" > "$statusf"
+  backdate "$statusf" "$status_age"
+}
+
+# Record the park exactly as the watcher leaves it right after firstmate has
+# been shown it: a live pause marker, a fresh authoritative recheck, the
+# re-surface throttle <resurfaced-age-secs> old, and the stale suppressor on
+# the current idle pane. The status signal is primed as already seen.
+seed_parked_state() {  # <dir> <window> <task> <resurfaced-age-secs>
+  local dir=$1 window=$2 task=$3 rf_age=$4 state key pane_hash
+  state="$dir/state"
+  printf '%s' "$(seen_sig "$state/$task.status")" > "$state/.seen-${task}_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "$PARKED_IDLE")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '1\n' > "$state/.count-$key"
+  : > "$state/.paused-$key"
+  date +%s > "$state/.paused-rechecked-$key"
+  date +%s > "$state/.paused-resurfaced-$key"
+  backdate "$state/.paused-resurfaced-$key" "$rf_age"
+}
+
+# Run the watcher against a parked live crew. Extra NAME=value arguments
+# override the environment for this one run.
+parked_watch_bg() {  # <dir> <window> <out> [NAME=value...]
+  local dir=$1 window=$2 out=$3
+  shift 3
+  env PATH="$dir/fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude FM_FAKE_CREW_STATE="$PARKED_CREW_STATE" \
+    FM_STATE_OVERRIDE="$dir/state" FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$@" "$WATCH" >> "$out" &
+}
+
+queued_count() {  # <state> <kind> [<key>]
+  [ -e "$1/.wake-queue" ] || { echo 0; return; }
+  awk -F '\t' -v k="$2" -v w="${3:-}" '$3 == k && (w == "" || $4 == w) { n++ } END { print n + 0 }' "$1/.wake-queue"
+}
+
+# The regression for the live defect: a parked live crew whose idle pane keeps
+# changing, below the re-surface window, must produce zero wakes. The watcher
+# used to reclassify every changed idle hash from scratch and, finding a live
+# agent, surface a bare stale wake for each one.
+test_parked_live_crew_idle_pane_churn_stays_silent() {
+  local dir state out window task key i pid
+  dir=$(make_case parked-live-churn); state="$dir/state"; out="$dir/watch.out"
+  window="test:fm-parked-churn"; task=parked-churn
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  make_parked_live_crew "$dir" "$window" "$task" 60
+  seed_parked_state "$dir" "$window" "$task" 60
+
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=999
+  pid=$!
+  i=1
+  while [ "$i" -le 4 ]; do
+    sleep 1.3
+    printf '❯ parked at the gate · footer tick %s\n' "$i" > "$dir/pane.txt"
+    kill -0 "$pid" 2>/dev/null || break
+    i=$((i + 1))
+  done
+  # Let the last idle hash settle into a repeat sighting as well.
+  wait_live "$pid" 40 || { reap "$pid"; fail "a parked live crew's idle pane churn woke firstmate: $(cat "$out")"; }
+  reap "$pid"
+  [ ! -s "$out" ] || fail "a parked live crew printed a wake reason: $(cat "$out")"
+  [ "$(queued_count "$state" stale)" -eq 0 ] || fail "a parked live crew queued $(queued_count "$state" stale) stale wakes below the re-surface window"
+  [ -e "$state/.paused-$key" ] || fail "idle pane churn cleared a live pause marker"
+  pass "a parked live crew whose idle pane churns produces no wake below the re-surface window"
+}
+
+# The same park observed from its start: the crew's paused: status line is
+# surfaced to firstmate as a signal, and the stale path must not then surface
+# the idle pane a second time as a bare stale wake.
+test_surfaced_pause_declaration_parks_live_crew_silently() {
+  local dir state out window task key pid
+  dir=$(make_case surfaced-pause-parks); state="$dir/state"; out="$dir/watch.out"
+  window="test:fm-parked-fresh"; task=parked-fresh
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  make_parked_live_crew "$dir" "$window" "$task" 0
+
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=999
+  pid=$!
+  wait_for_exit "$pid" 60 || fail "a fresh pause declaration was not surfaced as a status signal"
+  grep -F "signal:" "$out" >/dev/null || fail "the fresh pause declaration did not surface as a signal: $(cat "$out")"
+  [ "$(queued_count "$state" signal)" -ge 1 ] || fail "the pause declaration was not queued as a signal"
+  [ "$(queued_count "$state" stale)" -eq 0 ] || fail "the pause declaration was also queued as a stale wake"
+
+  : > "$out"
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=999
+  pid=$!
+  wait_live "$pid" 50 || { reap "$pid"; fail "an already-surfaced pause declaration woke firstmate again from the stale path: $(cat "$out")"; }
+  reap "$pid"
+  [ ! -s "$out" ] || fail "an already-surfaced pause declaration printed a wake reason: $(cat "$out")"
+  [ "$(queued_count "$state" stale)" -eq 0 ] || fail "an already-surfaced pause declaration queued a bare stale wake"
+  [ -e "$state/.paused-$key" ] || fail "the parked idle pane was not recorded under the pause"
+  pass "a pause declaration surfaced as a signal parks the live crew without a bare stale wake"
+}
+
+# A parked crew's monitor fires: its pane goes busy (the pause no longer holds),
+# its turn ends with a surfaced turn-end signal, and it goes idle again under the
+# same declaration. That turn end already showed firstmate the crew, so the idle
+# pane re-parks silently, and the old re-surface throttle survives the busy spell
+# so a long-parked crew is not rechecked again on every monitor tick.
+test_parked_crew_turn_with_surfaced_turn_end_reparks_silently() {
+  local dir state out window task key pid i
+  dir=$(make_case parked-turn-reparks); state="$dir/state"; out="$dir/watch.out"
+  window="test:fm-parked-turn"; task=parked-turn
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  make_parked_live_crew "$dir" "$window" "$task" 500
+  seed_parked_state "$dir" "$window" "$task" 30
+
+  printf '%s\n' "$PARKED_BUSY" > "$dir/pane.txt"
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=240
+  pid=$!
+  i=0
+  while [ "$i" -lt 60 ] && [ -e "$state/.paused-$key" ]; do sleep 0.1; i=$((i + 1)); done
+  [ ! -e "$state/.paused-$key" ] || { reap "$pid"; fail "a busy pane did not supersede the pause"; }
+  printf '❯ parked at the gate · footer tick 1\n' > "$dir/pane.txt"
+  : > "$state/$task.turn-ended"
+  wait_for_exit "$pid" 60 || fail "the parked crew's turn end was not surfaced"
+  grep -F "$task.turn-ended" "$out" >/dev/null || fail "the surfaced wake was not the crew's turn end: $(cat "$out")"
+  grep -F "stale:" "$out" >/dev/null && fail "the parked crew's turn surfaced a stale wake: $(cat "$out")"
+
+  : > "$out"
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=240
+  pid=$!
+  wait_live "$pid" 50 || { reap "$pid"; fail "a parked crew re-woke firstmate after its surfaced turn end: $(cat "$out")"; }
+  reap "$pid"
+  [ ! -s "$out" ] || fail "a re-parked crew printed a wake reason: $(cat "$out")"
+  [ "$(queued_count "$state" stale)" -eq 0 ] || fail "a re-parked crew queued $(queued_count "$state" stale) stale wakes"
+  [ -e "$state/.paused-$key" ] || fail "the idle pane after the turn was not re-parked under the pause"
+  pass "a parked crew's surfaced turn re-parks silently without resetting its re-surface throttle"
+}
+
+# The disconfirming case: a parked crew goes busy and then stops with no
+# surfaced turn end or new status, which is what a wedge after a resumed pause
+# looks like. The busy pane superseded the pause, so ordinary stale detection
+# surfaces it exactly once, and that surface re-parks it.
+test_parked_crew_resumed_then_stopped_surfaces_once() {
+  local dir state out window task key pid i
+  dir=$(make_case parked-resumed-stops); state="$dir/state"; out="$dir/watch.out"
+  window="test:fm-parked-resumed"; task=parked-resumed
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  make_parked_live_crew "$dir" "$window" "$task" 60
+  seed_parked_state "$dir" "$window" "$task" 60
+
+  printf '%s\n' "$PARKED_BUSY" > "$dir/pane.txt"
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=999
+  pid=$!
+  i=0
+  while [ "$i" -lt 60 ] && [ -e "$state/.paused-$key" ]; do sleep 0.1; i=$((i + 1)); done
+  [ ! -e "$state/.paused-$key" ] || { reap "$pid"; fail "a busy pane did not supersede the pause"; }
+  printf '❯ stopped mid-turn with no status\n' > "$dir/pane.txt"
+  wait_for_exit "$pid" 60 || fail "a crew that resumed and then stopped was never surfaced"
+  grep -Fx "stale: $window" "$out" >/dev/null || fail "the resumed-then-stopped crew did not surface through ordinary stale detection: $(cat "$out")"
+  [ "$(queued_count "$state" stale "$window")" -eq 1 ] || fail "the resumed-then-stopped crew was not surfaced exactly once"
+
+  : > "$out"
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=999
+  pid=$!
+  wait_live "$pid" 40 || { reap "$pid"; fail "the resumed-then-stopped crew surfaced again after its one surface: $(cat "$out")"; }
+  reap "$pid"
+  [ "$(queued_count "$state" stale "$window")" -eq 1 ] || fail "the resumed-then-stopped crew surfaced more than once"
+  pass "a parked crew that resumes and then stops is surfaced once through ordinary stale detection"
+}
+
+# Long-cadence recheck for a live parked crew: it still fires with its existing
+# wording once the pause is older than the re-surface window, then throttles.
+test_parked_live_crew_resurfaces_on_long_cadence() {
+  local dir state out window task pid
+  dir=$(make_case parked-live-resurface); state="$dir/state"; out="$dir/watch.out"
+  window="test:fm-parked-recheck"; task=parked-recheck
+  make_parked_live_crew "$dir" "$window" "$task" 500
+  seed_parked_state "$dir" "$window" "$task" 500
+
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=240
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "a live parked crew was not rechecked past the re-surface window"
+  grep -F "stale: $window (paused " "$out" >/dev/null || fail "the recheck lost its paused wording: $(cat "$out")"
+  grep -F "awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds" "$out" >/dev/null \
+    || fail "the recheck lost its awaiting-external wording: $(cat "$out")"
+
+  : > "$out"
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=240
+  pid=$!
+  wait_live "$pid" 30 || { reap "$pid"; fail "the long-cadence recheck was not throttled: $(cat "$out")"; }
+  reap "$pid"
+  [ "$(queued_count "$state" stale "$window")" -eq 1 ] || fail "the long-cadence recheck fired more than once in its window"
+  pass "a live parked crew is rechecked once per re-surface window with its existing wording"
+}
+
+# Cadence: a window already classified as parked must not re-run the costly
+# authoritative crew-state read on every poll. The throttled recheck stays,
+# because it is how a run that starts behind a declared pause takes over.
+test_parked_live_crew_skips_per_poll_authoritative_reads() {
+  local dir state out window task reads pid
+  dir=$(make_case parked-live-cadence); state="$dir/state"; out="$dir/watch.out"
+  window="test:fm-parked-cadence"; task=parked-cadence
+  reads="$dir/crew-state-reads"
+  make_parked_live_crew "$dir" "$window" "$task" 60
+  seed_parked_state "$dir" "$window" "$task" 60
+
+  parked_watch_bg "$dir" "$window" "$out" FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=999 FM_FAKE_CREW_STATE_LOG="$reads"
+  pid=$!
+  wait_live "$pid" 45 || { reap "$pid"; fail "a parked live crew woke firstmate on an unchanged pane: $(cat "$out")"; }
+  reap "$pid"
+  [ ! -s "$reads" ] || fail "a parked live crew re-read authoritative state $(awk 'END { print NR + 0 }' "$reads") times inside its recheck window"
+  [ ! -s "$out" ] || fail "a parked live crew printed a wake reason: $(cat "$out")"
+  pass "a parked live crew skips the authoritative read until its throttled recheck is due"
+}
+
 # --- consecutive wedge escalations on the same pane demand deep inspection ----
 # Root cause of the PR #252 incident's ~20 minutes of unnoticed green: each
 # wedge escalation fires, gets classified as "still validating" one poll later
@@ -1297,6 +1536,12 @@ test_secondmate_unpause_clears_pause_tracking
 test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash
 test_nonterminal_paused_rechecks_authoritative_state
 test_paused_authoritative_working_preserves_wedge_timer
+test_parked_live_crew_idle_pane_churn_stays_silent
+test_surfaced_pause_declaration_parks_live_crew_silently
+test_parked_crew_turn_with_surfaced_turn_end_reparks_silently
+test_parked_crew_resumed_then_stopped_surfaces_once
+test_parked_live_crew_resurfaces_on_long_cadence
+test_parked_live_crew_skips_per_poll_authoritative_reads
 test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_heartbeat_no_change_absorbed
