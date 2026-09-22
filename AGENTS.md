@@ -291,6 +291,7 @@ Before deciding any ask-user finding, load `ask-user-authority`; the implementat
 Never merge a red PR.
 Use `bin/fm-pr-merge.sh` for every task PR merge so merge metadata is recorded, and use `bin/fm-merge-local.sh` for approved local-only landing; never call a lower-level merge command around their guards.
 Both refuse to land a commit that has no local verification evidence bound to that exact commit, so record evidence with `bin/fm-verify.sh` before asking for or taking a merge, and record anything authorized to be skipped or waved through with `bin/fm-verify.sh bypass` rather than leaving it only in chat.
+After a rebase of a commit this task already fully verified, `bin/fm-verify.sh run <id> --post-rebase <prior>` re-runs only the project's declared post-rebase tier; it refuses anything that is not purely a rebase, and its help owns the rules.
 An unrecorded bypass is the one failure that gate cannot see; its merge override is deliberately awkward, loud, and permanently recorded, and is only for genuine environmental breakage, never for impatience.
 After an autonomous merge, give the captain a one-line full-URL or local-main outcome.
 

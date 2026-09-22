@@ -83,8 +83,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-pr-check-migrate.sh` | Quarantine older task polls without execution and rebuild only canonical polls       |
 | `fm-pr-check.sh`         | Record validated `pr=` and `pr_head=` values, then atomically arm a static merge poll |
 | `fm-pr-merge.sh`         | Record PR metadata, then merge a task's canonical full GitHub URL, refusing without verification evidence for the PR head |
-| `fm-verify.sh`           | Run a task's verification steps at its exact commit and record the real result, or record an authorized bypass |
-| `fm-verify-lib.sh`       | Verification ledger format, the fail-closed merge gate both merge entrypoints enforce, and the recorded override |
+| `fm-verify.sh`           | Run a task's verification steps at its exact commit and record the real result, run only the declared post-rebase tier for a rebase of a fully verified commit, or record an authorized bypass |
+| `fm-verify-lib.sh`       | Verification ledger format, the declared step set and post-rebase tier, the fail-closed merge gate both merge entrypoints enforce, and the recorded override |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-teardown.sh`         | Fail-closed teardown: return landed ship worktrees, require completed scout deliverables, retire secondmate homes |
 | `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |

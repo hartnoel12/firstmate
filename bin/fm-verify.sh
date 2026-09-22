@@ -9,6 +9,7 @@
 #
 # Usage:
 #   fm-verify.sh run <task-id>
+#   fm-verify.sh run <task-id> --post-rebase <prior-commit>
 #   fm-verify.sh run <task-id> --step <name> -- <command> [args...]
 #   fm-verify.sh bypass <task-id> (--step <name> | --all) --why <reason> --by <who>
 #   fm-verify.sh show <task-id>
@@ -21,9 +22,19 @@
 # With no declaration the gate still requires a passing run bound to the exact
 # commit, which is the floor, not the ceiling.
 #
+# `run <task-id> --post-rebase <prior-commit>` is for a head that only rebased a
+# commit this task already fully verified. It runs just the project's declared
+# post-rebase tier - the `@post-rebase` lines in that same file - and records a
+# post-rebase run naming <prior-commit>, never a plain pass. It refuses, before
+# any step runs, unless <prior-commit> holds a full passing record on this task
+# and the head's own change is that commit's own change and nothing else; the
+# merge gate checks both again. It is opt-in: plain `run` is unchanged. The
+# tier's grammar, the rebase test, and the gate contract are owned by
+# bin/fm-verify-lib.sh's POST-REBASE note.
+#
 # `run` refuses a dirty worktree and refuses to record if HEAD moved while the
-# commands were running. Evidence that does not describe a known tree state is
-# not evidence.
+# commands were running, with or without --post-rebase. Evidence that does not
+# describe a known tree state is not evidence.
 #
 # Gitignored untracked content (a build cache a prior occupant of a reused
 # worktree could have left behind, invisible to `git status` because ignored
@@ -95,13 +106,13 @@ if [ "$ACTION" = show ]; then
     printf 'no verification evidence recorded for %s\n' "$ID"
     exit 0
   fi
-  printf '%-9s %-20s %-40s %s\n' KIND WHEN COMMIT DETAIL
+  printf '%-11s %-20s %-40s %s\n' KIND WHEN COMMIT DETAIL
   while IFS=$'\t' read -r kind ts sha f4 f5 f6; do
     [ -n "$kind" ] || continue
     when=$(date -r "$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
       || date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
       || printf '%s' "$ts")
-    printf '%-9s %-20s %-40s %s | %s | %s\n' "$kind" "$when" "$sha" "$f4" "$f5" "$f6"
+    printf '%-11s %-20s %-40s %s | %s | %s\n' "$kind" "$when" "$sha" "$f4" "$f5" "$f6"
   done < "$LEDGER"
   exit 0
 fi
@@ -180,8 +191,16 @@ fi
 
 STEP_NAME=
 CMD=()
+POST_REBASE=0
+PRIOR_ARG=
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --post-rebase)
+      [ "$#" -ge 2 ] || die "--post-rebase needs <prior-commit>: a commit of this task that already holds a full passing record"
+      POST_REBASE=1
+      PRIOR_ARG=$2
+      shift 2
+      ;;
     --step)
       [ "$#" -ge 2 ] || die "--step needs a step name"
       fm_verify_step_name_valid "$2" || die "invalid step name '$2'"
@@ -199,6 +218,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$POST_REBASE" -eq 1 ] && { [ -n "$STEP_NAME" ] || [ "${#CMD[@]}" -gt 0 ]; }; then
+  die "--post-rebase runs the project's declared post-rebase tier and cannot be combined with --step or an ad-hoc command"
+fi
 if [ "${#CMD[@]}" -gt 0 ] && [ -z "$STEP_NAME" ]; then
   die "an ad-hoc command needs --step <name> so the evidence says what it checked"
 fi
@@ -246,6 +268,71 @@ fm_verify_sha_valid "$SHA_BEFORE" || die "cannot read a full commit id in $WT"
 
 RESULTS=
 OUTCOME=passed
+PRIOR=
+CARRIED=
+
+# post_rebase_narrow: apply POST-REBASE (bin/fm-verify-lib.sh) before anything
+# runs. Refuses unless the prior holds a full passing record on this task and
+# the head is a rebase of it, then narrows STEP_NAMES/STEP_CMDS to the tier this
+# rebase selects and sets PRIOR and CARRIED.
+post_rebase_narrow() {
+  local always required rc=0 i name line step why keep_names keep_cmds
+  keep_names=()
+  keep_cmds=()
+  always=$(fm_verify_rebase_always "$CONFIG_FILE") || exit 1
+  [ -n "$always" ] || die "$CONFIG_FILE declares no post-rebase tier, so there is nothing narrower to run.
+Declare one with '@post-rebase <step> always' and '@post-rebase <step> if-changed <pattern>...' lines,
+or verify this commit in full:
+  fm-verify.sh run $ID"
+  PRIOR=$(git -C "$WT" rev-parse -q --verify "$PRIOR_ARG^{commit}" 2>/dev/null) || PRIOR=
+  fm_verify_sha_valid "$PRIOR" || die "cannot resolve '$PRIOR_ARG' to a commit in $WT"
+  [ "$PRIOR" != "$SHA_BEFORE" ] \
+    || die "$PRIOR is the current head; a post-rebase run needs the earlier commit this head was rebased from"
+
+  required=$(fm_verify_required_steps "$CONFIG_FILE") || exit 1
+  if [ ! -f "$LEDGER" ] || [ -L "$LEDGER" ]; then
+    die "no full passing record for $PRIOR on task $ID (no verification evidence has been recorded for this task); verify this commit in full:
+  fm-verify.sh run $ID"
+  fi
+  fm_verify_ledger_read "$LEDGER" || die "$FM_VERIFY_REFUSAL"
+  fm_verify_prior_full "$PRIOR" "$required" \
+    || die "no full passing record for $PRIOR on task $ID ($FM_VERIFY_PRIOR_WHY); the post-rebase tier only ever narrows a full run, so verify this commit in full:
+  fm-verify.sh run $ID"
+  fm_verify_rebase_equivalent "$WT" "$PRIOR" "$SHA_BEFORE" || rc=$?
+  [ "$rc" -eq 0 ] || die "$FM_VERIFY_REFUSAL
+The post-rebase tier covers a rebase and nothing else; verify this commit in full:
+  fm-verify.sh run $ID"
+  fm_verify_rebase_select "$WT" "$PRIOR" "$SHA_BEFORE" "$FM_VERIFY_REBASE_BASE" "$CONFIG_FILE" \
+    || die "cannot apply the post-rebase tier to the rebase from $PRIOR to $SHA_BEFORE"
+
+  i=0
+  while [ "$i" -lt "${#STEP_NAMES[@]}" ]; do
+    name=${STEP_NAMES[$i]}
+    case "$FM_VERIFY_REBASE_SELECTED" in
+      *",$name,"*)
+        keep_names+=("$name")
+        keep_cmds+=("${STEP_CMDS[$i]}")
+        ;;
+      *) CARRIED="${CARRIED:+$CARRIED,}$name" ;;
+    esac
+    i=$((i + 1))
+  done
+  [ "${#keep_names[@]}" -gt 0 ] \
+    || die "the post-rebase tier selected no step to run at $SHA_BEFORE, so nothing would be verified"
+  STEP_NAMES=(${keep_names[@]+"${keep_names[@]}"})
+  STEP_CMDS=(${keep_cmds[@]+"${keep_cmds[@]}"})
+
+  printf 'post-rebase of %s: this head is a rebase of it onto %s\n' "$PRIOR" "${FM_VERIFY_REBASE_ONTO#refs/}"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    step=${line%%"$FM_VERIFY_TAB"*}
+    why=${line#*"$FM_VERIFY_TAB"}
+    printf '   re-run %s: %s\n' "$step" "$why"
+  done <<EOF
+$FM_VERIFY_REBASE_REASONS
+EOF
+  printf '   carried from %s: %s\n' "$PRIOR" "${CARRIED:-nothing}"
+}
 
 # record_step <name> <status>: accumulate one truthful step result.
 record_step() {
@@ -268,6 +355,8 @@ else
   # fm_verify_config_steps below rather than mistaken for "declares nothing", so
   # only a genuinely absent file reaches this message.
   if [ -z "$CONFIG_FILE" ] || { [ ! -e "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ]; }; then
+    [ "$POST_REBASE" -eq 0 ] \
+      || die "no verification steps declared for this project, so it declares no post-rebase tier either"
     die "no verification steps declared for this project.
 Declare them in ${CONFIG_FILE:-$CONFIG/verify/<project>} as '<step> = <command>' lines,
 or record one ad-hoc step:
@@ -286,6 +375,7 @@ or record one ad-hoc step:
     STEP_CMDS+=("$cmd")
   done <<< "$STEPS_TSV"
   [ "${#STEP_NAMES[@]}" -gt 0 ] || die "$CONFIG_FILE declares no steps"
+  [ "$POST_REBASE" -eq 0 ] || post_rebase_narrow
   # Declared steps are shell command lines written by the operator into a
   # firstmate-private config file, so they run through the shell deliberately.
   # Each runs with stdin on /dev/null: a step that reads stdin must neither eat
@@ -312,8 +402,15 @@ if [ "$SHA_AFTER" != "$SHA_BEFORE" ]; then
   die "HEAD moved from $SHA_BEFORE to $SHA_AFTER while verifying; nothing recorded, re-run against the final commit"
 fi
 
-fm_verify_append "$LEDGER" verify "$SHA_BEFORE" "$OUTCOME" "$RESULTS" "$IGNORED_NOTE" \
-  || die "could not record the verification result"
-
-printf 'recorded %s for %s at %s (%s)\n' "$OUTCOME" "$ID" "$SHA_BEFORE" "$RESULTS"
+if [ "$POST_REBASE" -eq 1 ]; then
+  fm_verify_append "$LEDGER" post-rebase "$SHA_BEFORE" "$OUTCOME" "$RESULTS" \
+    "prior=$PRIOR carried=${CARRIED:--} $IGNORED_NOTE" \
+    || die "could not record the verification result"
+  printf 'recorded post-rebase %s for %s at %s (%s; carried from %s: %s)\n' \
+    "$OUTCOME" "$ID" "$SHA_BEFORE" "$RESULTS" "$PRIOR" "${CARRIED:-nothing}"
+else
+  fm_verify_append "$LEDGER" verify "$SHA_BEFORE" "$OUTCOME" "$RESULTS" "$IGNORED_NOTE" \
+    || die "could not record the verification result"
+  printf 'recorded %s for %s at %s (%s)\n' "$OUTCOME" "$ID" "$SHA_BEFORE" "$RESULTS"
+fi
 [ "$OUTCOME" = passed ] || exit 1
