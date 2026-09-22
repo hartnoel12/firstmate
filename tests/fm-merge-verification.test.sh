@@ -42,6 +42,22 @@
 #       refuses in either order, while repeated passing runs still merge
 #   (t) a bypass stays visible to the gate when the ledger loses it, loses its
 #       trailing newline, or has one byte of its record damaged
+#   (u) after a rebase, a head whose own change is unchanged verifies with the
+#       declared post-rebase tier - the always steps plus the steps its diff
+#       selects - is recorded as a post-rebase run naming its prior, and merges
+#       on both paths
+#   (v) a head that is not merely a rebase is refused, naming the files whose
+#       change differs, and the merge gate re-proves that for itself rather
+#       than trusting the prior a record names
+#   (w) a prior with no full passing record - never verified, partly verified,
+#       carrying a failure, or itself only post-rebase verified - is refused
+#   (x) the merge gate holds a post-rebase record to its prior and its tier:
+#       a prior later recorded failed, a record missing an always step or a
+#       diff-selected step, or a bypass that only a carried step would cover,
+#       refuses
+#   (y) the post-rebase run keeps the full run's guards: dirty worktree, HEAD
+#       moving mid-run, no declared tier, a prior that is the head, and an
+#       ad-hoc command are all refused, and a malformed tier refuses loudly
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -863,6 +879,493 @@ test_bypass_survives_a_damaged_ledger() {
   pass "a recorded bypass still refuses when the ledger loses, truncates, or corrupts it"
 }
 
+# --- (u)-(y) the post-rebase tier -------------------------------------------
+#
+# bin/fm-verify-lib.sh's POST-REBASE note owns the contract. Every declared step
+# here logs its own name when it runs, so a case can see exactly which steps the
+# tier ran and which it carried from the prior. The honest-path evidence is
+# real; the refusal cases that need a record fm-verify.sh would never write (a
+# forged prior, a tier step missing) derive it from a genuine one, the way (t)
+# damages a genuine bypass.
+
+declare_tier() {  # <case_dir>: five declared steps and a post-rebase tier over them
+  local ran="$1/ran.log"
+  mkdir -p "$1/config/verify"
+  cat > "$1/config/verify/myproj" <<EOF
+types = echo types >> '$ran'
+unit = echo unit >> '$ran'
+mobile = echo mobile >> '$ran'
+lint = echo lint >> '$ran'
+secrets = echo secrets >> '$ran'
+@post-rebase types always
+@post-rebase unit always
+@post-rebase mobile if-changed apps/mobile/*
+@post-rebase lint if-changed *.ts
+@post-rebase secrets if-own-changed *
+EOF
+  : > "$ran"
+}
+
+ran_steps() {  # <case_dir>: the steps that ran since the log was last cleared
+  tr '\n' ' ' < "$1/ran.log" | sed 's/ $//'
+}
+
+full_verify() {  # <case_dir>: a full declared run at the task's current tip
+  run "$1" full "$VERIFY" run task-x1
+  [ "$RC" -eq 0 ] || fail "full_verify: the full declared run did not pass"
+  : > "$1/ran.log"
+}
+
+upstream_commit() {  # <case_dir> <path> <line>: move main forward
+  mkdir -p "$(dirname "$1/myproj/$2")"
+  printf '%s\n' "$3" >> "$1/myproj/$2"
+  git -C "$1/myproj" add -- "$2"
+  git -C "$1/myproj" commit -qm "upstream $2"
+}
+
+branch_commit() {  # <case_dir> <path> <line>: more work on the task branch
+  mkdir -p "$(dirname "$1/wt/$2")"
+  printf '%s\n' "$3" >> "$1/wt/$2"
+  git -C "$1/wt" add -- "$2"
+  git -C "$1/wt" commit -qm "branch $2"
+  git -C "$1/wt" rev-parse HEAD > "$1/pr-head"
+}
+
+rebase_task() {  # <case_dir>: rebase the task branch onto main
+  git -C "$1/wt" rebase -q main
+  git -C "$1/wt" rev-parse HEAD > "$1/pr-head"
+}
+
+post_rebase_records() {  # <case_dir>: how many post-rebase records the ledger holds
+  local n
+  n=$(grep -c '^post-rebase	' "$1/state/task-x1.verification" 2>/dev/null) || true
+  printf '%s' "${n:-0}"
+}
+
+# A genuine post-rebase record, rewritten by sed, for the refusal cases.
+rewrite_ledger() {  # <case_dir> <sed-expression>
+  local ledger="$1/state/task-x1.verification"
+  sed "$2" "$ledger" > "$ledger.new" && mv "$ledger.new" "$ledger"
+}
+
+# Record a run at an older commit of the task, the way firstmate would: check
+# it out in the task worktree, run, and return to the branch.
+at_commit() {  # <case_dir> <commit> <label> <fm-verify args...>
+  local case_dir=$1 commit=$2 label=$3
+  shift 3
+  git -C "$case_dir/wt" checkout -q --detach "$commit"
+  run "$case_dir" "$label" "$VERIFY" "$@"
+  git -C "$case_dir/wt" checkout -q fm/task-x1
+}
+
+# --- (u) a rebase-only head verifies with the tier and merges ---------------
+
+test_post_rebase_tier_verifies_and_merges() {
+  local case_dir mode prior head
+  for mode in local-only no-mistakes; do
+    case_dir=$(make_case "rebase-merges-$mode" "$mode")
+    declare_tier "$case_dir"
+    full_verify "$case_dir"
+    prior=$(tip "$case_dir")
+    upstream_commit "$case_dir" apps/mobile/app.ts 'export const x = 1;'
+    rebase_task "$case_dir"
+    head=$(tip "$case_dir")
+    [ "$head" != "$prior" ] || fail "rebase-merges-$mode: fixture did not rewrite the branch"
+
+    run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+    expect_code 0 "$RC" "rebase-merges-$mode: a rebase-only head should verify with the tier"
+    [ "$(ran_steps "$case_dir")" = 'types unit mobile lint' ] \
+      || fail "rebase-merges-$mode: the tier ran '$(ran_steps "$case_dir")', expected the always steps plus the two the diff selects"
+
+    # The ledger says what happened: a post-rebase run of this head, naming its
+    # prior and what it carried from it - never a plain pass.
+    tail -1 "$case_dir/state/task-x1.verification" > "$case_dir/last-record"
+    grep -q "^post-rebase	[0-9]*	$head	passed	types:passed,unit:passed,mobile:passed,lint:passed	prior=$prior carried=secrets " \
+      "$case_dir/last-record" \
+      || fail "rebase-merges-$mode: the ledger did not record a post-rebase run naming its prior: $(cat "$case_dir/last-record")"
+
+    if [ "$mode" = local-only ]; then
+      run "$case_dir" merge "$MERGE_LOCAL" task-x1
+      expect_code 0 "$RC" "rebase-merges-$mode: the post-rebase-verified head should merge"
+      [ "$(main_of "$case_dir")" = "$head" ] \
+        || fail "rebase-merges-$mode: local main did not fast-forward to the rebased head"
+    else
+      run "$case_dir" merge "$PR_MERGE" task-x1 "$PR_URL"
+      expect_code 0 "$RC" "rebase-merges-$mode: the post-rebase-verified PR head should merge"
+      assert_grep 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+        "rebase-merges-$mode: the forge was not asked to merge"
+    fi
+    assert_grep "post-rebase of $prior" "$case_dir/merge.out" \
+      "rebase-merges-$mode: the merge did not say the head rode on a post-rebase run"
+    assert_grep 'carried: secrets' "$case_dir/merge.out" \
+      "rebase-merges-$mode: the merge did not say which steps were carried from the prior"
+  done
+  pass "a rebase-only head verifies with the declared tier, is recorded as post-rebase, and merges on both paths"
+}
+
+test_post_rebase_selects_own_files_the_rebase_changed() {
+  local case_dir prior
+  case_dir=$(make_case rebase-own-file local-only)
+  declare_tier "$case_dir"
+  # A file both sides edit. The upstream inserts a line between the branch's
+  # two edits: the rebase is clean, yet it shifts the branch's hunk offsets,
+  # changes both blob ids, and puts the upstream's line inside the branch hunks'
+  # context - all of which a rebase alone produces, and none of which is the
+  # branch's change. diff.interHunkContext, an ordinary user setting, would pull
+  # that line back into even a zero-context diff.
+  git -C "$case_dir/myproj" config diff.interHunkContext 10
+  printf 'l%s\n' 1 2 3 4 5 6 7 8 9 10 11 12 > "$case_dir/myproj/shared.txt"
+  git -C "$case_dir/myproj" add shared.txt
+  git -C "$case_dir/myproj" commit -qm "shared file"
+  rebase_task "$case_dir"
+  printf 'l%s\n' 1 A 3 4 5 6 7 B 9 10 11 12 > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" commit -qam "branch edits shared"
+  full_verify "$case_dir"
+  prior=$(tip "$case_dir")
+  printf 'l%s\n' 1 2 3 4 5 U 6 7 8 9 10 11 12 > "$case_dir/myproj/shared.txt"
+  git -C "$case_dir/myproj" commit -qam "upstream edits shared"
+  rebase_task "$case_dir"
+
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 0 "$RC" "rebase-own-file: a clean rebase over a shared file is still a rebase"
+  [ "$(ran_steps "$case_dir")" = 'types unit secrets' ] \
+    || fail "rebase-own-file: the tier ran '$(ran_steps "$case_dir")', expected the always steps plus the own-file step"
+  pass "a step scoped to the branch's own files re-runs when the rebase changed one of them"
+}
+
+# --- (v) a head that is not merely a rebase is refused ----------------------
+
+test_post_rebase_refuses_a_head_that_is_not_a_rebase() {
+  local case_dir prior
+  # New work riding along with the rebase.
+  case_dir=$(make_case rebase-new-work local-only)
+  declare_tier "$case_dir"
+  full_verify "$case_dir"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  branch_commit "$case_dir" src/extra.ts 'export const extra = 1;'
+
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 1 "$RC" "rebase-new-work: a head carrying new work must not verify as a rebase"
+  assert_grep "is not a rebase of $prior" "$case_dir/verify.err" \
+    "rebase-new-work: the refusal did not say the head is not a rebase"
+  assert_grep 'src/extra.ts' "$case_dir/verify.err" \
+    "rebase-new-work: the refusal did not name the file beyond the rebase signature"
+  assert_no_grep 'docs/notes.md' "$case_dir/verify.err" \
+    "rebase-new-work: the upstream's own change was named as a difference"
+  [ -z "$(ran_steps "$case_dir")" ] || fail "rebase-new-work: steps ran on a refused run"
+  [ "$(post_rebase_records "$case_dir")" = 0 ] \
+    || fail "rebase-new-work: a refused run still recorded a post-rebase record"
+
+  # Different added lines in a file the branch already changed.
+  case_dir=$(make_case rebase-rewritten local-only)
+  declare_tier "$case_dir"
+  full_verify "$case_dir"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  printf 'a different change\n' >> "$case_dir/wt/README.md"
+  git -C "$case_dir/wt" commit -q --amend -a --no-edit
+
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 1 "$RC" "rebase-rewritten: a head whose added lines changed must not verify as a rebase"
+  assert_grep 'README.md' "$case_dir/verify.err" \
+    "rebase-rewritten: the refusal did not name the file whose change differs"
+  [ "$(post_rebase_records "$case_dir")" = 0 ] \
+    || fail "rebase-rewritten: a refused run still recorded a post-rebase record"
+
+  # The full path is unchanged, and remains the way forward.
+  run "$case_dir" verify "$VERIFY" run task-x1
+  expect_code 0 "$RC" "rebase-rewritten: the full run should still verify the rewritten head"
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  expect_code 0 "$RC" "rebase-rewritten: the fully verified head should merge"
+
+  # A binary file the branch adds, with different bytes after the rebase. A
+  # plain diff renders both as one identical "Binary files differ" line.
+  case_dir=$(make_case rebase-binary local-only)
+  declare_tier "$case_dir"
+  printf 'one\000\001\002' > "$case_dir/wt/asset.bin"
+  git -C "$case_dir/wt" add asset.bin
+  git -C "$case_dir/wt" commit -qm "branch asset"
+  full_verify "$case_dir"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  printf 'two\000\001\002' > "$case_dir/wt/asset.bin"
+  git -C "$case_dir/wt" commit -q --amend -a --no-edit
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 1 "$RC" "rebase-binary: different binary content must not verify as a rebase"
+  assert_grep 'asset.bin' "$case_dir/verify.err" \
+    "rebase-binary: the refusal did not name the binary file whose content differs"
+  pass "a head that is not merely a rebase is refused, naming the files that differ"
+}
+
+test_gate_reproves_the_rebase_itself() {
+  local case_dir first second before
+  case_dir=$(make_case rebase-forged-prior local-only)
+  declare_tier "$case_dir"
+  full_verify "$case_dir"
+  first=$(tip "$case_dir")
+  branch_commit "$case_dir" src/extra.ts 'export const extra = 1;'
+  full_verify "$case_dir"
+  second=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  before=$(main_of "$case_dir")
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$second"
+  expect_code 0 "$RC" "rebase-forged-prior: the honest post-rebase run should record"
+
+  # Both priors are fully verified, but only the second is this head's change.
+  rewrite_ledger "$case_dir" "s/prior=$second/prior=$first/"
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  expect_code 4 "$RC" "rebase-forged-prior: a record naming a prior the head is not a rebase of must not merge"
+  assert_grep "is not a rebase of $first" "$case_dir/merge.err" \
+    "rebase-forged-prior: the gate did not re-prove the rebase"
+  assert_grep 'src/extra.ts' "$case_dir/merge.err" \
+    "rebase-forged-prior: the gate did not name the file beyond the rebase signature"
+  assert_not_merged_local "$case_dir" "$before" \
+    "rebase-forged-prior: local main moved on a record whose prior is not the head's change"
+  pass "the merge gate re-proves the rebase for itself rather than trusting the prior a record names"
+}
+
+# --- (w) no full prior record, no narrowed run ------------------------------
+
+test_post_rebase_refuses_without_a_full_prior_record() {
+  local case_dir prior first middle
+  # Never verified at all.
+  case_dir=$(make_case rebase-never-verified local-only)
+  declare_tier "$case_dir"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 1 "$RC" "rebase-never-verified: a task with no full run must not get the narrowed tier"
+  assert_grep "no full passing record for $prior" "$case_dir/verify.err" \
+    "rebase-never-verified: the refusal did not name the missing full record"
+  [ -z "$(ran_steps "$case_dir")" ] || fail "rebase-never-verified: steps ran on a refused run"
+  assert_absent "$case_dir/state/task-x1.verification" \
+    "rebase-never-verified: a refused run still wrote the ledger"
+
+  # Only part of the declared set ran at the prior.
+  case_dir=$(make_case rebase-partial-prior local-only)
+  declare_tier "$case_dir"
+  run "$case_dir" v0 "$VERIFY" run task-x1 --step types -- ./pass.sh
+  expect_code 0 "$RC" "rebase-partial-prior: the partial run should record"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 1 "$RC" "rebase-partial-prior: a partly verified prior must not anchor the tier"
+  assert_grep "no full passing record for $prior" "$case_dir/verify.err" \
+    "rebase-partial-prior: the refusal did not name the missing full record"
+  [ "$(post_rebase_records "$case_dir")" = 0 ] \
+    || fail "rebase-partial-prior: a refused run still recorded a post-rebase record"
+  # Control: once the prior genuinely holds a full record, the same rebase is accepted.
+  at_commit "$case_dir" "$prior" full-at-prior run task-x1
+  expect_code 0 "$RC" "rebase-partial-prior: the full run at the prior should pass"
+  : > "$case_dir/ran.log"
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 0 "$RC" "rebase-partial-prior: a fully verified prior should anchor the tier"
+
+  # A prior whose record also carries a failure.
+  case_dir=$(make_case rebase-failed-prior local-only)
+  declare_tier "$case_dir"
+  full_verify "$case_dir"
+  run "$case_dir" v1 "$VERIFY" run task-x1 --step lint -- ./fail.sh
+  expect_code 1 "$RC" "rebase-failed-prior: the failing run should record"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 1 "$RC" "rebase-failed-prior: a prior carrying a failure must not anchor the tier"
+  assert_grep "no full passing record for $prior" "$case_dir/verify.err" \
+    "rebase-failed-prior: the refusal did not name the missing full record"
+
+  # A prior verified only by a post-rebase run is not a full record: no chains.
+  case_dir=$(make_case rebase-chain local-only)
+  declare_tier "$case_dir"
+  full_verify "$case_dir"
+  first=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/one.md 'first upstream move'
+  rebase_task "$case_dir"
+  run "$case_dir" v1 "$VERIFY" run task-x1 --post-rebase "$first"
+  expect_code 0 "$RC" "rebase-chain: the first post-rebase run should record"
+  middle=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/two.md 'second upstream move'
+  rebase_task "$case_dir"
+  : > "$case_dir/ran.log"
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$middle"
+  expect_code 1 "$RC" "rebase-chain: a post-rebase-verified prior must not anchor another tier run"
+  assert_grep "no full passing record for $middle" "$case_dir/verify.err" \
+    "rebase-chain: the refusal did not name the missing full record"
+  # The original full record still anchors any number of rebases.
+  run "$case_dir" v2 "$VERIFY" run task-x1 --post-rebase "$first"
+  expect_code 0 "$RC" "rebase-chain: the original full record should anchor the second rebase"
+  pass "a prior with no full passing record - absent, partial, failed, or post-rebase only - is refused"
+}
+
+# --- (x) the gate holds a post-rebase record to its prior and its tier ------
+
+test_gate_holds_post_rebase_to_its_prior_and_tier() {
+  local case_dir prior head before missing
+  # The prior's full record is contradicted after the post-rebase run.
+  case_dir=$(make_case rebase-prior-contradicted local-only)
+  declare_tier "$case_dir"
+  full_verify "$case_dir"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  before=$(main_of "$case_dir")
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 0 "$RC" "rebase-prior-contradicted: the post-rebase run should record"
+  at_commit "$case_dir" "$prior" v-fail run task-x1 --step unit -- ./fail.sh
+  expect_code 1 "$RC" "rebase-prior-contradicted: the failing run at the prior should record"
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  expect_code 4 "$RC" "rebase-prior-contradicted: a head whose prior is recorded failed must not merge"
+  assert_grep "no full passing record for $prior" "$case_dir/merge.err" \
+    "rebase-prior-contradicted: the refusal did not name the prior"
+  assert_not_merged_local "$case_dir" "$before" \
+    "rebase-prior-contradicted: local main moved on a contradicted prior"
+
+  # A post-rebase record missing an always step, or a step its diff selects.
+  for missing in unit mobile; do
+    case_dir=$(make_case "rebase-missing-$missing" local-only)
+    declare_tier "$case_dir"
+    full_verify "$case_dir"
+    prior=$(tip "$case_dir")
+    upstream_commit "$case_dir" apps/mobile/app.ts 'export const x = 1;'
+    rebase_task "$case_dir"
+    before=$(main_of "$case_dir")
+    head=$(tip "$case_dir")
+    run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+    expect_code 0 "$RC" "rebase-missing-$missing: the post-rebase run should record"
+    rewrite_ledger "$case_dir" "/^post-rebase/s/,$missing:passed//"
+    run "$case_dir" merge "$MERGE_LOCAL" task-x1
+    expect_code 4 "$RC" "rebase-missing-$missing: a post-rebase record without '$missing' must not merge"
+    assert_grep "'$missing' has no passing record for commit $head" "$case_dir/merge.err" \
+      "rebase-missing-$missing: the refusal did not name the missing tier step"
+    assert_not_merged_local "$case_dir" "$before" \
+      "rebase-missing-$missing: local main moved without the tier's '$missing' step"
+  done
+
+  # A carried step never supersedes a bypass: only a record for the exact
+  # commit does, and the prior's pass of 'secrets' is a record for the prior.
+  case_dir=$(make_case rebase-bypass-carried local-only)
+  declare_tier "$case_dir"
+  run "$case_dir" bypass "$VERIFY" bypass task-x1 --step secrets \
+    --why "secrets scan skipped during the scanner outage" --by captain
+  expect_code 0 "$RC" "rebase-bypass-carried: recording the bypass failed"
+  full_verify "$case_dir"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  before=$(main_of "$case_dir")
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 0 "$RC" "rebase-bypass-carried: the post-rebase run should record"
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  expect_code 4 "$RC" "rebase-bypass-carried: a bypass covered only by a carried step must not merge"
+  assert_grep "a bypass of 'secrets' is recorded against this task" "$case_dir/merge.err" \
+    "rebase-bypass-carried: the refusal did not name the bypass"
+  assert_grep 'never supersede a bypass' "$case_dir/merge.err" \
+    "rebase-bypass-carried: the refusal did not say why the carried step does not count"
+  assert_not_merged_local "$case_dir" "$before" \
+    "rebase-bypass-carried: local main moved over a bypass only a carried step covers"
+  pass "the merge gate refuses a post-rebase record whose prior is contradicted, whose tier is incomplete, or whose carried step would be all that covers a bypass"
+}
+
+# --- (y) the post-rebase run keeps the full run's guards --------------------
+
+test_post_rebase_keeps_the_run_guards() {
+  local case_dir prior
+  # A dirty worktree.
+  case_dir=$(make_case rebase-dirty local-only)
+  declare_tier "$case_dir"
+  full_verify "$case_dir"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  printf 'uncommitted\n' >> "$case_dir/wt/README.md"
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 1 "$RC" "rebase-dirty: a dirty worktree must be refused"
+  assert_grep 'uncommitted changes' "$case_dir/verify.err" \
+    "rebase-dirty: the refusal did not name the uncommitted work"
+  [ -z "$(ran_steps "$case_dir")" ] || fail "rebase-dirty: steps ran on a dirty worktree"
+  git -C "$case_dir/wt" checkout -q -- README.md
+
+  # A prior that is the head itself, and an ad-hoc command.
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$(tip "$case_dir")"
+  expect_code 1 "$RC" "rebase-dirty: the head cannot be its own prior"
+  assert_grep 'is the current head' "$case_dir/verify.err" \
+    "rebase-dirty: the refusal did not say the prior is the head"
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior" --step x -- ./pass.sh
+  expect_code 1 "$RC" "rebase-dirty: an ad-hoc command must not ride on --post-rebase"
+  assert_grep 'cannot be combined' "$case_dir/verify.err" \
+    "rebase-dirty: the refusal did not say the two cannot be combined"
+  [ "$(post_rebase_records "$case_dir")" = 0 ] \
+    || fail "rebase-dirty: a refused run still recorded a post-rebase record"
+
+  # HEAD moving while the tier runs.
+  case_dir=$(make_case rebase-head-moves local-only)
+  declare_tier "$case_dir"
+  full_verify "$case_dir"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  sed 's/^unit = .*/unit = git commit -q --allow-empty -m moved/' \
+    "$case_dir/config/verify/myproj" > "$case_dir/tier.new"
+  mv "$case_dir/tier.new" "$case_dir/config/verify/myproj"
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 1 "$RC" "rebase-head-moves: a head that moved mid-run must not record"
+  assert_grep 'HEAD moved' "$case_dir/verify.err" \
+    "rebase-head-moves: the refusal did not name the moved HEAD"
+  [ "$(post_rebase_records "$case_dir")" = 0 ] \
+    || fail "rebase-head-moves: a moved HEAD still recorded a post-rebase record"
+
+  # No declared tier.
+  case_dir=$(make_case rebase-no-tier local-only)
+  mkdir -p "$case_dir/config/verify"
+  printf 'test = ./pass.sh\n' > "$case_dir/config/verify/myproj"
+  run "$case_dir" full "$VERIFY" run task-x1
+  expect_code 0 "$RC" "rebase-no-tier: the full run should pass"
+  prior=$(tip "$case_dir")
+  upstream_commit "$case_dir" docs/notes.md 'upstream notes'
+  rebase_task "$case_dir"
+  run "$case_dir" verify "$VERIFY" run task-x1 --post-rebase "$prior"
+  expect_code 1 "$RC" "rebase-no-tier: a project with no declared tier must not get a narrowed run"
+  assert_grep 'declares no post-rebase tier' "$case_dir/verify.err" \
+    "rebase-no-tier: the refusal did not name the missing tier"
+  [ "$(post_rebase_records "$case_dir")" = 0 ] \
+    || fail "rebase-no-tier: a refused run still recorded a post-rebase record"
+  pass "the post-rebase run keeps the full run's guards and refuses without a declared tier"
+}
+
+check_bad_tier() {  # <case_dir> <tier line> <expected refusal>
+  local case_dir=$1 bad=$2 expect=$3
+  printf 'types = ./pass.sh\n%s\n' "$bad" > "$case_dir/config/verify/myproj"
+  run "$case_dir" verify "$VERIFY" run task-x1
+  expect_code 1 "$RC" "rebase-bad-tier: '$bad' should refuse the run"
+  assert_grep "$expect" "$case_dir/verify.err" \
+    "rebase-bad-tier: '$bad' was not refused as '$expect'"
+  run "$case_dir" merge "$MERGE_LOCAL" task-x1
+  [ "$RC" -ne 0 ] || fail "rebase-bad-tier: '$bad' let the merge proceed"
+  assert_grep "$expect" "$case_dir/merge.err" \
+    "rebase-bad-tier: the merge did not refuse '$bad' as '$expect'"
+}
+
+test_malformed_tier_refuses_loudly() {
+  local case_dir
+  case_dir=$(make_case rebase-bad-tier local-only)
+  mkdir -p "$case_dir/config/verify"
+  check_bad_tier "$case_dir" '@post-rebase ghost always' "post-rebase tier names undeclared step 'ghost'"
+  check_bad_tier "$case_dir" '@post-rebase types sometimes' "unknown post-rebase selector 'sometimes'"
+  check_bad_tier "$case_dir" '@post-rebase types if-changed' 'needs at least one path pattern'
+  check_bad_tier "$case_dir" '@post-rebase types always apps/*' 'takes no path patterns'
+  check_bad_tier "$case_dir" '@post-rebase types if-changed apps/*' "declares no '@post-rebase <step> always' step"
+  check_bad_tier "$case_dir" '@rebase types always' "unknown directive '@rebase'"
+  pass "a malformed post-rebase tier is refused by both the run and the merge, never read as no tier"
+}
+
 test_local_refuses_without_any_record
 test_pr_refuses_without_any_record
 test_local_refuses_stale_record
@@ -891,3 +1394,11 @@ test_repeated_passing_runs_still_merge
 test_steps_from_separate_runs_combine
 test_bypass_is_recorded_in_both_homes
 test_bypass_survives_a_damaged_ledger
+test_post_rebase_tier_verifies_and_merges
+test_post_rebase_selects_own_files_the_rebase_changed
+test_post_rebase_refuses_a_head_that_is_not_a_rebase
+test_gate_reproves_the_rebase_itself
+test_post_rebase_refuses_without_a_full_prior_record
+test_gate_holds_post_rebase_to_its_prior_and_tier
+test_post_rebase_keeps_the_run_guards
+test_malformed_tier_refuses_loudly

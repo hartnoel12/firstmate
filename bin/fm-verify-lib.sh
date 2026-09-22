@@ -23,9 +23,10 @@
 # per line, TAB-separated, first field is the record kind. Writers sanitize TAB
 # and newline out of every field, so the line count is the record count.
 #
-#   verify   <epoch> <sha>      <outcome>  <steps>  <note>
-#   bypass   <epoch> <sha>      <what>     <why>    <by>
-#   override <epoch> <sha>      <path>     <reason> <by>
+#   verify      <epoch> <sha> <outcome> <steps>  <note>
+#   post-rebase <epoch> <sha> <outcome> <steps>  <note>
+#   bypass      <epoch> <sha> <what>    <why>    <by>
+#   override    <epoch> <sha> <path>    <reason> <by>
 #
 #   sha      full 40-hex commit the record is bound to ('-' for an unbound
 #            bypass, which can never be superseded by evidence)
@@ -36,7 +37,15 @@
 #            paths at run time, so a later reader can tell whether two runs of
 #            the same commit saw the same ignored-tree state. This gate never
 #            reads or judges it; ignored content is recorded, never refused.
+#            A post-rebase record's note is
+#            `prior=<sha> carried=<steps|-> ignored=<count>:<digest>`: the
+#            commit whose full record it relies on, and the declared steps it
+#            did not run. The gate reads `prior=` and nothing else from it.
 #   what     comma-separated bypassed step names, or '*' for "the whole run"
+#
+# A post-rebase record is the narrowed run POST-REBASE below describes. It is a
+# distinct kind so no reader, human or gate, can mistake it for a full pass; a
+# gate that predates the kind refuses it as unknown rather than misreading it.
 #
 # THE GATE (fm_verify_gate) refuses unless ALL of these hold for the exact
 # commit being merged:
@@ -47,7 +56,9 @@
 #      them is recorded failed (see PRECEDENCE below);
 #   3. every step the project declares required (config/verify/<project>) is in
 #      the passing union - a declared step absent from every run is a SKIPPED
-#      step, and skipped is not passed;
+#      step, and skipped is not passed. The one exception is a step CARRIED
+#      from the prior of a post-rebase record bound to this commit, and only
+#      when every POST-REBASE precondition below still holds at merge time;
 #   4. no bypass recorded against the task survives, in EITHER durable record
 #      (see TWO RECORDS below). A bypass naming steps is superseded only by
 #      positive evidence: each named step must itself be in the passing union
@@ -84,6 +95,61 @@
 # gate reads is parsed strictly: a line it cannot split into exactly six fields,
 # or whose kind it does not recognise, refuses the merge instead of being
 # skipped as noise.
+#
+# POST-REBASE. A rebase gives a branch a new head whose own change is the one
+# already verified, on top of a newer upstream. Re-running every declared step
+# there mostly re-proves what a rebase cannot have changed, but skipping them
+# all is not safe either: a conflict-free rebase still breaks the build when the
+# upstream changed something the branch calls, in a file the branch never
+# touched, and nothing in the branch's own diff shows it. So a project may
+# declare a post-rebase tier in config/verify/<project>, one
+# `@post-rebase <step> <selector> [<pattern>...]` line per rule:
+#
+#   always                    every rebase re-runs the step
+#   if-changed <pattern>...   re-run when a file matching a pattern differs
+#                             between the prior and the new head
+#   if-own-changed <pattern>... the same, restricted to files the branch's own
+#                             change touches (the upstream's content was
+#                             verified before it landed there)
+#
+# Patterns are shell `case` patterns matched against repository-relative paths,
+# so `*` also matches `/`. Several rules for one step select it when any does.
+# A tier must name only declared steps and include at least one `always` step,
+# and a malformed tier line refuses both the run and the merge rather than
+# reading as "no tier" - the same rule the declared step set already follows.
+#
+# `bin/fm-verify.sh run <task> --post-rebase <prior>` runs that tier, opt-in and
+# never by default, and records a post-rebase record naming <prior>. It is
+# accepted only while ALL of these hold. fm-verify.sh checks them before any
+# step runs, and the gate checks them again at merge time from the ledger, the
+# current declaration, and git, trusting nothing in the record beyond the step
+# results it holds and the prior it names:
+#
+#   a. <prior> holds a FULL passing record on this task: every currently
+#      declared step has a passing record bound to <prior> itself, and nothing
+#      recorded there failed - exactly what rules 1-3 would accept for <prior>
+#      with nothing carried. A step a post-rebase run carried is not a record at
+#      its commit, so carried evidence can never anchor another rebase; the
+#      original full record anchors any number of them, because rule b compares
+#      against it directly.
+#   b. the new head is a rebase of <prior>: the branch's own change - the diff
+#      from where each commit forks off the project's upstream branch - is the
+#      same on both sides, file for file, differing only in blob ids (`index`
+#      lines) and hunk offsets. Reachability is deliberately not the test: a
+#      rebased head does not contain its prior, and a head that does contain it
+#      may carry new work. The diffs are taken with zero context lines, because
+#      the upstream's own edits beside a branch hunk are not the branch's
+#      change; any added or removed line, mode change, or file that differs
+#      refuses, naming the files. The upstream is the project's default branch
+#      as origin/HEAD names it (else main or master), as the remote-tracking
+#      ref and as the local branch; a branch rebased onto any other base is
+#      refused and verified in full.
+#   c. every `always` step, and every step the diff between <prior> and the new
+#      head selects, passed at the new head.
+#
+# A declared step the post-rebase run did not re-run is carried from <prior>
+# for rule 3 alone. It does not supersede a bypass under rule 4, which still
+# needs a passing record for the exact commit being merged.
 #
 # Sourced by bin/fm-verify.sh, bin/fm-pr-merge.sh, bin/fm-merge-local.sh, and
 # the tests. No side effects on source. set -u / set -e safe.
@@ -179,10 +245,14 @@ fm_verify_config_path() {
   printf '%s/verify/%s' "$config_dir" "$name"
 }
 
-# fm_verify_config_steps <config-file>: echo one "<step>\t<command>" line per
-# declared step. Blank lines and # comments are ignored; a line without '=' or
-# with an unusable step name is a configuration error, reported and refused, so
-# a typo silently lowers no bar.
+# fm_verify_config_parse <config-file>: the one reader of a declaration. Echoes
+# one "step<TAB><name><TAB><command>" line per declared step and one
+# "rule<TAB><step><TAB><selector><TAB><patterns>" line per post-rebase tier
+# rule (POST-REBASE above; patterns '-' for `always`), in file order, and only
+# once the WHOLE file has validated, so no caller ever acts on part of one.
+# Blank lines and # comments are ignored; a line without '=', an unusable step
+# name, or a malformed tier line is a configuration error, reported and
+# refused, so a typo silently lowers no bar.
 #
 # Absent is the one silent success: a project that declares nothing is a
 # legitimate case and leaves the gate at its floor. A declaration that EXISTS
@@ -190,8 +260,9 @@ fm_verify_config_path() {
 # no declaration, and must never be read as one: that would quietly drop a
 # project from its own declared bar back to the floor. It is reported and
 # refused, the way this library refuses a symlinked ledger.
-fm_verify_config_steps() {
-  local file=$1 line name cmd
+fm_verify_config_parse() {
+  local file=$1 line name cmd rest selector patterns out='' declared=',' ruled=''
+  local has_always=0
   [ -n "$file" ] || return 0
   if [ ! -e "$file" ] && [ ! -L "$file" ]; then
     return 0
@@ -205,12 +276,55 @@ fm_verify_config_steps() {
       ''|'#'*|[[:space:]]*'#'*) continue ;;
     esac
     case "$line" in
+      '@post-rebase'|'@post-rebase '*|"@post-rebase$FM_VERIFY_TAB"*)
+        rest=${line#@post-rebase}
+        name='' selector='' patterns=''
+        read -r name selector patterns <<< "$rest"
+        patterns=$(printf '%s' "$patterns" | tr -s ' \t' '  ')
+        if [ -z "$name" ] || [ -z "$selector" ]; then
+          echo "error: $file: a post-rebase tier line needs a step and a selector: $line" >&2
+          return 1
+        fi
+        if ! fm_verify_step_name_valid "$name"; then
+          echo "error: $file: invalid step name '$name' in post-rebase tier line: $line" >&2
+          return 1
+        fi
+        case "$selector" in
+          always)
+            if [ -n "$patterns" ]; then
+              echo "error: $file: post-rebase step '$name' is always re-run and takes no path patterns: $line" >&2
+              return 1
+            fi
+            patterns='-'
+            has_always=1
+            ;;
+          if-changed|if-own-changed)
+            if [ -z "$patterns" ]; then
+              echo "error: $file: post-rebase selector '$selector' needs at least one path pattern: $line" >&2
+              return 1
+            fi
+            ;;
+          *)
+            echo "error: $file: unknown post-rebase selector '$selector' (expected always, if-changed, or if-own-changed): $line" >&2
+            return 1
+            ;;
+        esac
+        ruled="$ruled$name,"
+        out="${out}rule$FM_VERIFY_TAB$name$FM_VERIFY_TAB$selector$FM_VERIFY_TAB$patterns$FM_VERIFY_NL"
+        continue
+        ;;
+      '@'*)
+        echo "error: $file: unknown directive '${line%%[[:space:]]*}' (expected '@post-rebase <step> <selector> [<pattern>...]'): $line" >&2
+        return 1
+        ;;
+    esac
+    case "$line" in
       *=*) ;;
-      *)
-        [ -z "$(fm_verify_field_clean "$line")" ] && continue
+      *[![:space:]]*)
         echo "error: $file: expected '<step> = <command>', got: $line" >&2
         return 1
         ;;
+      *) continue ;;
     esac
     name=${line%%=*}
     cmd=${line#*=}
@@ -224,8 +338,50 @@ fm_verify_config_steps() {
       echo "error: $file: step '$name' declares no command" >&2
       return 1
     fi
-    printf '%s\t%s\n' "$name" "$cmd"
+    declared="$declared$name,"
+    out="${out}step$FM_VERIFY_TAB$name$FM_VERIFY_TAB$cmd$FM_VERIFY_NL"
   done < "$file"
+
+  # Cross-checks that need the whole file: a tier step may be declared after the
+  # rule that names it.
+  rest=$ruled
+  while [ -n "$rest" ]; do
+    name=${rest%%,*}
+    rest=${rest#*,}
+    case "$declared" in
+      *",$name,"*) ;;
+      *)
+        echo "error: $file: the post-rebase tier names undeclared step '$name'; declare it as '$name = <command>'" >&2
+        return 1
+        ;;
+    esac
+  done
+  if [ -n "$ruled" ] && [ "$has_always" -eq 0 ]; then
+    echo "error: $file: the post-rebase tier declares no '@post-rebase <step> always' step; a tier that can re-run nothing after a rebase cannot see the upstream breaking what the branch calls" >&2
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+# fm_verify_config_select <config-file> <kind>: the fields after <kind> of every
+# parsed line of that kind, one per line.
+fm_verify_config_select() {  # <config-file> <kind>
+  local parsed line
+  parsed=$(fm_verify_config_parse "$1") || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "$2$FM_VERIFY_TAB"*) printf '%s\n' "${line#"$2$FM_VERIFY_TAB"}" ;;
+    esac
+  done <<EOF
+$parsed
+EOF
+}
+
+# fm_verify_config_steps <config-file>: echo one "<step>\t<command>" line per
+# declared step, validating the whole declaration first.
+fm_verify_config_steps() {
+  [ -n "${1:-}" ] || return 0
+  fm_verify_config_select "$1" step
 }
 
 # fm_verify_required_steps <config-file>: comma-separated declared step names,
@@ -235,6 +391,35 @@ fm_verify_required_steps() {
   steps=$(fm_verify_config_steps "$1") || return 1
   out=$(printf '%s' "$steps" | cut -f1 | paste -sd, - 2>/dev/null) || return 1
   printf '%s' "$out"
+}
+
+# fm_verify_rebase_rules <config-file>: one "<step>\t<selector>\t<patterns>"
+# line per post-rebase tier rule, in file order; nothing when none is declared.
+fm_verify_rebase_rules() {
+  [ -n "${1:-}" ] || return 0
+  fm_verify_config_select "$1" rule
+}
+
+# fm_verify_rebase_always <config-file>: comma-separated `always` tier steps,
+# empty when the project declares no post-rebase tier.
+fm_verify_rebase_always() {
+  local rules line step selector out=','
+  rules=$(fm_verify_rebase_rules "${1:-}") || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    step=${line%%"$FM_VERIFY_TAB"*}
+    selector=${line#*"$FM_VERIFY_TAB"}
+    selector=${selector%%"$FM_VERIFY_TAB"*}
+    [ "$selector" = always ] || continue
+    case "$out" in
+      *",$step,"*) ;;
+      *) out="$out$step," ;;
+    esac
+  done <<EOF
+$rules
+EOF
+  out=${out#,}
+  printf '%s' "${out%,}"
 }
 
 # --- reading records back ---------------------------------------------------
@@ -312,16 +497,540 @@ fm_verify_csv_tail() {
   esac
 }
 
-# fm_verify_gate <ledger> <sha> <required-csv> [<meta>]: 0 when the exact commit
-# has genuine, complete, unbypassed local verification evidence. 1 otherwise,
-# with FM_VERIFY_REFUSAL explaining which of the four rules failed. <meta> is the
-# task's metadata file, the bypass record's second home; omitting it consults the
-# ledger alone.
-fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
-  local ledger=$1 sha=$2 required=${3:-} meta=${4:-}
-  local line kind outcome steps what why value
-  local found=0 rest pair name status req run_failed=0
-  local passed='' evidence='' first_failed_step='' bypasses=''
+# fm_verify_ledger_read <ledger>: the one strict pass over the ledger. Leaves
+# every verify and post-rebase record in FM_VERIFY_RUNS as
+# "<kind>\t<sha>\t<outcome>\t<steps>\t<note>\n" and every bypass in
+# FM_VERIFY_BYPASSES as "<what>\t<why>\n", in ledger order, so no rule needs to
+# open the file a second time. 1, with FM_VERIFY_REFUSAL, on any record it
+# cannot read. `|| [ -n "$line" ]` keeps the final record when the file lost its
+# trailing newline: without it the LAST line is dropped silently, and the last
+# line is exactly where a freshly recorded bypass is.
+FM_VERIFY_RUNS=''
+FM_VERIFY_BYPASSES=''
+fm_verify_ledger_read() {  # <ledger>
+  local line
+  FM_VERIFY_RUNS=''
+  FM_VERIFY_BYPASSES=''
+  while IFS= read -r line || [ -n "$line" ]; do
+    # A blank line is not a record this file's writers can produce, so it is
+    # damage, not noise: skipping it is how a NUL-truncated record disappears
+    # (Bash 3.2's read stops at a NUL and hands back an empty line, where Bash 5
+    # hands back the bytes after it).
+    if [ -z "$line" ] || ! fm_verify_record_split "$line"; then
+      FM_VERIFY_REFUSAL="the verification ledger holds a record this gate cannot read, so what was verified cannot be established"
+      return 1
+    fi
+    case "$FM_VERIFY_REC_KIND" in
+      verify|post-rebase)
+        FM_VERIFY_RUNS="$FM_VERIFY_RUNS$FM_VERIFY_REC_KIND$FM_VERIFY_TAB$FM_VERIFY_REC_SHA$FM_VERIFY_TAB$FM_VERIFY_REC_F4$FM_VERIFY_TAB$FM_VERIFY_REC_F5$FM_VERIFY_TAB$FM_VERIFY_REC_F6$FM_VERIFY_NL"
+        ;;
+      bypass)
+        FM_VERIFY_BYPASSES="$FM_VERIFY_BYPASSES$FM_VERIFY_REC_F4$FM_VERIFY_TAB$FM_VERIFY_REC_F5$FM_VERIFY_NL"
+        ;;
+      override) ;;
+      *)
+        FM_VERIFY_REFUSAL="the verification ledger holds a record of unknown kind '$FM_VERIFY_REC_KIND', so what was verified cannot be established"
+        return 1
+        ;;
+    esac
+  done < "$1"
+  return 0
+}
+
+# fm_verify_note_prior <note> <own-sha>: echo the one `prior=<sha>` a
+# post-rebase record's note names. Non-zero when there is none, more than one,
+# an unusable commit id, or the record's own commit.
+fm_verify_note_prior() {  # <note> <own-sha>
+  local note=" $1 " value
+  case "$note" in
+    *" prior="*) ;;
+    *) return 1 ;;
+  esac
+  value=${note#*" prior="}
+  case "$value" in
+    *" prior="*) return 1 ;;
+  esac
+  value=${value%%" "*}
+  fm_verify_sha_valid "$value" || return 1
+  [ "$value" != "$2" ] || return 1
+  printf '%s' "$value"
+}
+
+# fm_verify_tally <sha>: judge every loaded run bound to <sha>. Sets
+#   FM_VERIFY_T_FOUND         1 when any verify or post-rebase record names it
+#   FM_VERIFY_T_RUN_FAILED    1 when any of those runs did not pass
+#   FM_VERIFY_T_FIRST_FAILED  the first step recorded failed there, if any
+#   FM_VERIFY_T_PASSED        ",a,b," - every step recorded passed there
+#   FM_VERIFY_T_EVIDENCE      "a:passed,b:passed" in first-seen order
+#   FM_VERIFY_T_PRIORS        the priors its post-rebase records name
+# 1, with FM_VERIFY_REFUSAL, when a record bound to <sha> is malformed.
+FM_VERIFY_T_FOUND=0
+FM_VERIFY_T_RUN_FAILED=0
+FM_VERIFY_T_FIRST_FAILED=''
+FM_VERIFY_T_PASSED=''
+FM_VERIFY_T_EVIDENCE=''
+FM_VERIFY_T_PRIORS=''
+fm_verify_tally() {  # <sha>
+  local sha=$1 rest line kind rsha outcome steps note srest pair name status prior
+  FM_VERIFY_T_FOUND=0
+  FM_VERIFY_T_RUN_FAILED=0
+  FM_VERIFY_T_FIRST_FAILED=''
+  FM_VERIFY_T_PASSED=''
+    FM_VERIFY_T_EVIDENCE=''
+  FM_VERIFY_T_PRIORS=''
+  rest=$FM_VERIFY_RUNS
+  while [ -n "$rest" ]; do
+    line=${rest%%"$FM_VERIFY_NL"*}
+    rest=${rest#*"$FM_VERIFY_NL"}
+    kind=${line%%"$FM_VERIFY_TAB"*}
+    line=${line#*"$FM_VERIFY_TAB"}
+    rsha=${line%%"$FM_VERIFY_TAB"*}
+    line=${line#*"$FM_VERIFY_TAB"}
+    [ "$rsha" = "$sha" ] || continue
+    outcome=${line%%"$FM_VERIFY_TAB"*}
+    line=${line#*"$FM_VERIFY_TAB"}
+    steps=${line%%"$FM_VERIFY_TAB"*}
+    note=${line#*"$FM_VERIFY_TAB"}
+    FM_VERIFY_T_FOUND=1
+    case "$outcome" in
+      passed|failed) ;;
+      *)
+        FM_VERIFY_REFUSAL="a verification run recorded for commit $sha has an unreadable outcome ('$outcome')"
+        return 1
+        ;;
+    esac
+    # Precedence (see header): a run that did not pass disqualifies its commit
+    # outright, whatever a later run of the same commit says.
+    [ "$outcome" = passed ] || FM_VERIFY_T_RUN_FAILED=1
+    if [ "$kind" = post-rebase ]; then
+      if ! prior=$(fm_verify_note_prior "$note" "$sha"); then
+        FM_VERIFY_REFUSAL="a post-rebase record for commit $sha does not name one readable prior commit, so what it relies on cannot be established"
+        return 1
+      fi
+      case " $FM_VERIFY_T_PRIORS " in
+        *" $prior "*) ;;
+        *) FM_VERIFY_T_PRIORS="${FM_VERIFY_T_PRIORS:+$FM_VERIFY_T_PRIORS }$prior" ;;
+      esac
+    fi
+    if [ -z "$steps" ] || [ "$steps" = '-' ]; then
+      continue
+    fi
+    srest=$steps
+    while [ -n "$srest" ]; do
+      pair=$(fm_verify_csv_head "$srest")
+      srest=$(fm_verify_csv_tail "$srest")
+      [ -n "$pair" ] || continue
+      name=${pair%%:*}
+      status=${pair#*:}
+      if [ -z "$name" ] || [ "$name" = "$pair" ]; then
+        FM_VERIFY_REFUSAL="a verification record for commit $sha is malformed and cannot be trusted"
+        return 1
+      fi
+      case "$status" in
+        passed)
+          case "$FM_VERIFY_T_PASSED" in
+            *",$name,"*) ;;
+            *)
+              FM_VERIFY_T_PASSED="${FM_VERIFY_T_PASSED:-,}$name,"
+              FM_VERIFY_T_EVIDENCE="${FM_VERIFY_T_EVIDENCE:+$FM_VERIFY_T_EVIDENCE,}$name:passed"
+              ;;
+          esac
+          ;;
+        failed)
+          [ -n "$FM_VERIFY_T_FIRST_FAILED" ] || FM_VERIFY_T_FIRST_FAILED=$name
+          ;;
+        *)
+          FM_VERIFY_REFUSAL="verification step '$name' has an unreadable result ('$status') for commit $sha"
+          return 1
+          ;;
+      esac
+    done
+  done
+  return 0
+}
+
+# fm_verify_prior_full <prior> <required-csv>: 0 when the loaded ledger holds a
+# FULL passing record for <prior> (POST-REBASE rule a). Otherwise 1, with
+# FM_VERIFY_PRIOR_WHY saying what is missing.
+FM_VERIFY_PRIOR_WHY=''
+fm_verify_prior_full() {  # <prior> <required-csv>
+  local rest req
+  FM_VERIFY_PRIOR_WHY=''
+  if ! fm_verify_tally "$1"; then
+    FM_VERIFY_PRIOR_WHY=$FM_VERIFY_REFUSAL
+    return 1
+  fi
+  if [ "$FM_VERIFY_T_FOUND" -eq 0 ]; then
+    FM_VERIFY_PRIOR_WHY="no verification run is recorded for it on this task"
+    return 1
+  fi
+  if [ -n "$FM_VERIFY_T_FIRST_FAILED" ]; then
+    FM_VERIFY_PRIOR_WHY="step '$FM_VERIFY_T_FIRST_FAILED' is recorded failed there"
+    return 1
+  fi
+  if [ "$FM_VERIFY_T_RUN_FAILED" -eq 1 ]; then
+    FM_VERIFY_PRIOR_WHY="a run there is recorded failed"
+    return 1
+  fi
+  if [ -z "$FM_VERIFY_T_PASSED" ]; then
+    FM_VERIFY_PRIOR_WHY="the verification recorded there checked nothing"
+    return 1
+  fi
+  rest=$2
+  while [ -n "$rest" ]; do
+    req=$(fm_verify_csv_head "$rest")
+    rest=$(fm_verify_csv_tail "$rest")
+    [ -n "$req" ] || continue
+    case "$FM_VERIFY_T_PASSED" in
+      *",$req,"*) ;;
+      *)
+        if [ -n "$FM_VERIFY_T_PRIORS" ]; then
+          FM_VERIFY_PRIOR_WHY="declared step '$req' has no passing record there; a post-rebase run carried it, and a carried step never anchors another rebase"
+        else
+          FM_VERIFY_PRIOR_WHY="declared step '$req' has no passing record there"
+        fi
+        return 1
+        ;;
+    esac
+  done
+  return 0
+}
+
+# fm_verify_upstream_refs <repo>: the refs a task branch is rebased onto, one per
+# line - the project's default branch (origin/HEAD's target, else main or
+# master) as the remote-tracking ref and as the local branch, whichever exist.
+fm_verify_upstream_refs() {  # <repo>
+  local repo=$1 target name='' ref
+  target=$(git -C "$repo" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || target=''
+  case "$target" in
+    refs/remotes/origin/?*) name=${target#refs/remotes/origin/} ;;
+  esac
+  if [ -z "$name" ]; then
+    for ref in main master; do
+      if git -C "$repo" rev-parse -q --verify "refs/remotes/origin/$ref^{commit}" >/dev/null 2>&1 \
+        || git -C "$repo" rev-parse -q --verify "refs/heads/$ref^{commit}" >/dev/null 2>&1; then
+        name=$ref
+        break
+      fi
+    done
+  fi
+  [ -n "$name" ] || return 0
+  for ref in "refs/remotes/origin/$name" "refs/heads/$name"; do
+    if git -C "$repo" rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "$ref"
+    fi
+  done
+  return 0
+}
+
+# fm_verify_change_set <repo> <upstream> <commit> <out>: write <commit>'s own
+# change - the diff from where it forks off <upstream> to it - to <out> in the
+# rebase-invariant form of POST-REBASE rule b, and echo that fork point.
+#
+# Every option that could make two runs of one diff disagree, or hide a change
+# from both, is pinned rather than left to git config: no external diff or
+# textconv driver, no color, fixed prefixes, no rename detection (a similarity
+# heuristic), submodule changes shown as their commit ids and never ignored.
+# --binary keeps a changed binary file's content in the comparison instead of
+# one "Binary files differ" line that two different changes share. -U0 drops
+# context lines, and --inter-hunk-context=0 stops diff.interHunkContext from
+# merging nearby hunks and pulling the lines between them back in. Then the only two
+# things a rebase alone changes are normalized away: `index <blob>..<blob>`
+# lines, and the offsets in `@@ -a,b +c,d @@ <heading>`, which keep only their
+# line counts. Neither pattern can match a content line, which always starts
+# with '+', '-', or '\', nor a base85 line of a binary patch, which never
+# contains a space.
+fm_verify_change_set() {  # <repo> <upstream> <commit> <out>
+  local repo=$1 upstream=$2 commit=$3 out=$4 base
+  base=$(git -C "$repo" merge-base "$upstream" "$commit" 2>/dev/null) || return 1
+  fm_verify_sha_valid "$base" || return 1
+  git -C "$repo" diff --no-ext-diff --no-textconv --no-color --no-renames \
+    --submodule=short --ignore-submodules=none --inter-hunk-context=0 \
+    --binary -U0 --src-prefix=a/ --dst-prefix=b/ "$base" "$commit" -- \
+    > "$out.raw" 2>/dev/null || return 1
+  awk '
+    /^index / { next }
+    /^@@ / && $4 == "@@" && $2 ~ /^-[0-9]+(,[0-9]+)?$/ && $3 ~ /^[+][0-9]+(,[0-9]+)?$/ {
+      oc = (index($2, ",") ? substr($2, index($2, ",") + 1) : 1)
+      nc = (index($3, ",") ? substr($3, index($3, ",") + 1) : 1)
+      print "@@ -" oc " +" nc " @@"
+      next
+    }
+    { print }
+  ' "$out.raw" > "$out" || return 1
+  rm -f -- "$out.raw"
+  printf '%s' "$base"
+}
+
+# fm_verify_change_set_split <set> <dir> <side>: split one normalized change set
+# into <dir>/<side>.<n> per file, indexed by "<n>\t<path>" lines in
+# <dir>/<side>.index. With renames off a header is always `a/X b/X`, so X is
+# recovered exactly; a quoted header is kept whole.
+fm_verify_change_set_split() {  # <set> <dir> <side>
+  : > "$2/$3.index" || return 1
+  awk -v dir="$2" -v side="$3" '
+    /^diff --git / {
+      if (out != "") close(out)
+      n++
+      out = dir "/" side "." n
+      name = substr($0, 12)
+      l = length(name)
+      if (substr(name, 1, 2) == "a/" && (l - 5) % 2 == 0) {
+        k = (l - 5) / 2
+        if (substr(name, 3 + k, 3) == " b/" && substr(name, 3, k) == substr(name, 6 + k)) {
+          name = substr(name, 3, k)
+        }
+      }
+      print n "\t" name >> (dir "/" side ".index")
+    }
+    out != "" { print > (out) }
+  ' "$1"
+}
+
+# fm_verify_change_set_differences <prior-set> <head-set> <dir>: echo which
+# files' changes differ between two normalized change sets, as
+# "changed differently: a; only in the head: b; only in the prior: c".
+fm_verify_change_set_differences() {  # <prior-set> <head-set> <dir>
+  local dir=$3 where np nh path changed='' only_head='' only_prior='' out=''
+  fm_verify_change_set_split "$1" "$dir" p || return 1
+  fm_verify_change_set_split "$2" "$dir" h || return 1
+  awk -F '\t' '
+    FILENAME == ARGV[1] { p[$2] = $1; next }
+    {
+      if ($2 in p) { print "both\t" p[$2] "\t" $1 "\t" $2; seen[$2] = 1 }
+      else print "head\t-\t" $1 "\t" $2
+    }
+    END { for (k in p) if (!(k in seen)) print "prior\t" p[k] "\t-\t" k }
+  ' "$dir/p.index" "$dir/h.index" > "$dir/joined" || return 1
+  while IFS="$FM_VERIFY_TAB" read -r where np nh path; do
+    case "$where" in
+      both)
+        cmp -s "$dir/p.$np" "$dir/h.$nh" || changed="$changed$path$FM_VERIFY_NL"
+        ;;
+      head) only_head="$only_head$path$FM_VERIFY_NL" ;;
+      prior) only_prior="$only_prior$path$FM_VERIFY_NL" ;;
+    esac
+  done < "$dir/joined"
+  [ -z "$changed" ] || out="changed differently: $(fm_verify_list_join "$changed")"
+  [ -z "$only_head" ] || out="${out:+$out; }only in the head: $(fm_verify_list_join "$only_head")"
+  [ -z "$only_prior" ] || out="${out:+$out; }only in the prior: $(fm_verify_list_join "$only_prior")"
+  printf '%s' "${out:-the files match but their changes do not}"
+}
+
+# fm_verify_list_join <newline-list>: the list sorted and joined with ", ".
+fm_verify_list_join() {
+  printf '%s' "$1" | LC_ALL=C sort | awk 'NF { printf "%s%s", (n++ ? ", " : ""), $0 }'
+}
+
+# fm_verify_rebase_equivalent <repo> <prior> <head>: 0 when <head> is a rebase of
+# <prior> under POST-REBASE rule b, against any of the project's upstream refs,
+# setting FM_VERIFY_REBASE_ONTO to that ref and FM_VERIFY_REBASE_BASE to the
+# head's fork point off it. 1 when it is not, with FM_VERIFY_REFUSAL naming the
+# files whose change differs. 2 when it cannot be established at all.
+FM_VERIFY_REBASE_ONTO=''
+FM_VERIFY_REBASE_BASE=''
+fm_verify_rebase_equivalent() {  # <repo> <prior> <head>
+  local repo=$1 prior=$2 head=$3 refs ref tmp base diffs='' against='' rc=2
+  FM_VERIFY_REBASE_ONTO=''
+  FM_VERIFY_REBASE_BASE=''
+  refs=$(fm_verify_upstream_refs "$repo")
+  if [ -z "$refs" ]; then
+    FM_VERIFY_REFUSAL="cannot find the project's upstream branch (origin/HEAD, main, or master) in $repo, so whether $head is a rebase of $prior cannot be established"
+    return 2
+  fi
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-verify-rebase.XXXXXX") || {
+    FM_VERIFY_REFUSAL="cannot create a temporary directory to compare $head with $prior"
+    return 2
+  }
+  # Ref names cannot contain whitespace or glob characters, so word splitting
+  # the newline-separated list is exact.
+  # shellcheck disable=SC2086
+  for ref in $refs; do
+    fm_verify_change_set "$repo" "$ref" "$prior" "$tmp/prior" >/dev/null || continue
+    base=$(fm_verify_change_set "$repo" "$ref" "$head" "$tmp/head") || continue
+    if cmp -s "$tmp/prior" "$tmp/head"; then
+      FM_VERIFY_REBASE_ONTO=$ref
+      FM_VERIFY_REBASE_BASE=$base
+      rc=0
+      break
+    fi
+    if [ "$rc" -eq 2 ]; then
+      diffs='the changes differ'
+      if mkdir "$tmp/split"; then
+        diffs=$(fm_verify_change_set_differences "$tmp/prior" "$tmp/head" "$tmp/split") \
+          || diffs='the changes differ'
+      fi
+      against=$ref
+      rc=1
+    fi
+  done
+  rm -rf -- "$tmp"
+  case "$rc" in
+    0) return 0 ;;
+    1)
+      FM_VERIFY_REFUSAL="commit $head is not a rebase of $prior: the branch's own change against ${against#refs/} differs beyond blob ids and hunk offsets ($diffs)"
+      return 1
+      ;;
+  esac
+  FM_VERIFY_REFUSAL="cannot diff $prior and $head against the project's upstream branch in $repo, so whether $head is a rebase of $prior cannot be established"
+  return 2
+}
+
+# fm_verify_rebase_select <repo> <prior> <head> <head-base> <config-file>: apply
+# the declared tier to this rebase (POST-REBASE rule c). Sets
+# FM_VERIFY_REBASE_SELECTED to ",a,b," - every step the tier re-runs - and
+# FM_VERIFY_REBASE_REASONS to one "<step>\t<why>" line per step, in rule order.
+# <head-base> is the head's fork point off its upstream, which bounds the
+# branch's own files. A path the tier cannot represent (one holding a newline)
+# selects every conditional step rather than none.
+FM_VERIFY_REBASE_SELECTED=''
+FM_VERIFY_REBASE_REASONS=''
+fm_verify_rebase_select() {  # <repo> <prior> <head> <head-base> <config-file>
+  local repo=$1 prior=$2 head=$3 base=$4 config=$5 rules tmp path changed='' own=''
+  local odd=0 line step selector patterns why pat prest
+  FM_VERIFY_REBASE_SELECTED=','
+  FM_VERIFY_REBASE_REASONS=''
+  rules=$(fm_verify_rebase_rules "$config") || return 1
+  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-verify-select.XXXXXX") || return 1
+  if ! git -C "$repo" diff --name-only -z --no-renames --ignore-submodules=none \
+    "$prior" "$head" -- > "$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      *"$FM_VERIFY_NL"*) odd=1 ;;
+      *) changed="$changed$path$FM_VERIFY_NL" ;;
+    esac
+  done < "$tmp"
+  if ! git -C "$repo" diff --name-only -z --no-renames --ignore-submodules=none \
+    "$base" "$head" -- > "$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      *"$FM_VERIFY_NL"*) odd=1 ;;
+      *) own="$own$path$FM_VERIFY_NL" ;;
+    esac
+  done < "$tmp"
+  rm -f -- "$tmp"
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    step=${line%%"$FM_VERIFY_TAB"*}
+    line=${line#*"$FM_VERIFY_TAB"}
+    selector=${line%%"$FM_VERIFY_TAB"*}
+    patterns=${line#*"$FM_VERIFY_TAB"}
+    case "$FM_VERIFY_REBASE_SELECTED" in
+      *",$step,"*) continue ;;
+    esac
+    why=''
+    if [ "$selector" = always ]; then
+      why='always re-run after a rebase'
+    elif [ "$odd" -eq 1 ]; then
+      why='the rebase changed a path this tier cannot represent'
+    else
+      while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if [ "$selector" = if-own-changed ]; then
+          case "$FM_VERIFY_NL$own" in
+            *"$FM_VERIFY_NL$path$FM_VERIFY_NL"*) ;;
+            *) continue ;;
+          esac
+        fi
+        prest="$patterns "
+        while [ -n "$prest" ]; do
+          pat=${prest%%" "*}
+          prest=${prest#*" "}
+          [ -n "$pat" ] || continue
+          # Unquoted on purpose: the declared pattern is a shell pattern.
+          # shellcheck disable=SC2254
+          case "$path" in
+            $pat)
+              if [ "$selector" = if-own-changed ]; then
+                why="$path, one of the branch's own files, changed"
+              else
+                why="$path changed"
+              fi
+              break 2
+              ;;
+          esac
+        done
+      done <<EOF
+$changed
+EOF
+    fi
+    [ -n "$why" ] || continue
+    FM_VERIFY_REBASE_SELECTED="$FM_VERIFY_REBASE_SELECTED$step,"
+    FM_VERIFY_REBASE_REASONS="$FM_VERIFY_REBASE_REASONS$step$FM_VERIFY_TAB$why$FM_VERIFY_NL"
+  done <<EOF
+$rules
+EOF
+  return 0
+}
+
+# fm_verify_post_rebase_holds <sha> <passed-set> <priors> <required-csv>
+# <config-file> <repo>: 0 when every POST-REBASE precondition still holds for
+# every prior the post-rebase records bound to <sha> name, so the declared steps
+# they did not re-run may be carried. Otherwise 1, with FM_VERIFY_REFUSAL.
+# Every named prior must hold, not just one: a prior recorded failed is evidence
+# against this head's change, whatever another prior says.
+fm_verify_post_rebase_holds() {  # <sha> <passed-set> <priors> <required-csv> <config-file> <repo>
+  local sha=$1 passed=$2 priors=$3 required=$4 config=$5 repo=$6
+  local always prior line step why
+  if [ -z "$config" ] || [ -z "$repo" ]; then
+    FM_VERIFY_REFUSAL="a post-rebase run is recorded for commit $sha, but this merge path did not supply the project's declaration and repository needed to check it"
+    return 1
+  fi
+  if ! always=$(fm_verify_rebase_always "$config" 2>/dev/null); then
+    FM_VERIFY_REFUSAL="the project's verification declaration cannot be read, so the post-rebase run recorded for commit $sha cannot be checked"
+    return 1
+  fi
+  if [ -z "$always" ]; then
+    FM_VERIFY_REFUSAL="a post-rebase run is recorded for commit $sha, but the project declares no post-rebase tier, so nothing can be carried from its prior"
+    return 1
+  fi
+  # Priors are validated 40-hex commit ids, so word splitting is exact.
+  # shellcheck disable=SC2086
+  for prior in $priors; do
+    if ! fm_verify_prior_full "$prior" "$required"; then
+      FM_VERIFY_REFUSAL="the post-rebase run recorded for commit $sha relies on commit $prior, but there is no full passing record for $prior ($FM_VERIFY_PRIOR_WHY)"
+      return 1
+    fi
+    fm_verify_rebase_equivalent "$repo" "$prior" "$sha" || return 1
+    if ! fm_verify_rebase_select "$repo" "$prior" "$sha" "$FM_VERIFY_REBASE_BASE" "$config"; then
+      FM_VERIFY_REFUSAL="cannot apply the post-rebase tier to the rebase from $prior to $sha in $repo"
+      return 1
+    fi
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      step=${line%%"$FM_VERIFY_TAB"*}
+      why=${line#*"$FM_VERIFY_TAB"}
+      case "$passed" in
+        *",$step,"*) ;;
+        *)
+          FM_VERIFY_REFUSAL="the post-rebase tier re-runs '$step' after the rebase from $prior ($why), and '$step' has no passing record for commit $sha"
+          return 1
+          ;;
+      esac
+    done <<EOF
+$FM_VERIFY_REBASE_REASONS
+EOF
+  done
+  return 0
+}
+
+# fm_verify_gate <ledger> <sha> <required-csv> [<meta>] [<config-file> <repo>]:
+# 0 when the exact commit has genuine, complete, unbypassed local verification
+# evidence. 1 otherwise, with FM_VERIFY_REFUSAL explaining which of the four
+# rules failed. <meta> is the task's metadata file, the bypass record's second
+# home; omitting it consults the ledger alone. <config-file> and <repo> are the
+# project's declaration and repository, which a post-rebase record is checked
+# against; without them no step is ever carried, so omitting them only refuses.
+fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>] [<config-file> <repo>]
+  local ledger=$1 sha=$2 required=${3:-} meta=${4:-} config=${5:-} repo=${6:-}
+  local line what why value rest req passed evidence priors missing='' first_missing=''
 
   FM_VERIFY_REFUSAL=''
   FM_VERIFY_EVIDENCE=''
@@ -335,91 +1044,23 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
     return 1
   fi
 
-  # One strict pass over the ledger, the only read of it. Bypass records are
-  # collected here and judged after the loop, once `passed` is complete, so no
-  # rule needs to open the file a second time. `|| [ -n "$line" ]` keeps the
-  # final record when the file lost its trailing newline: without it the LAST
-  # line is dropped silently, and the last line is exactly where a freshly
-  # recorded bypass is.
-  while IFS= read -r line || [ -n "$line" ]; do
-    # A blank line is not a record this file's writers can produce, so it is
-    # damage, not noise: skipping it is how a NUL-truncated record disappears
-    # (Bash 3.2's read stops at a NUL and hands back an empty line, where Bash 5
-    # hands back the bytes after it).
-    if [ -z "$line" ] || ! fm_verify_record_split "$line"; then
-      FM_VERIFY_REFUSAL="the verification ledger holds a record this gate cannot read, so what was verified cannot be established"
-      return 1
-    fi
-    kind=$FM_VERIFY_REC_KIND
-    case "$kind" in
-      verify|bypass|override) ;;
-      *)
-        FM_VERIFY_REFUSAL="the verification ledger holds a record of unknown kind '$kind', so what was verified cannot be established"
-        return 1
-        ;;
-    esac
-    if [ "$kind" = bypass ]; then
-      bypasses="$bypasses$FM_VERIFY_REC_F4$FM_VERIFY_TAB$FM_VERIFY_REC_F5$FM_VERIFY_NL"
-      continue
-    fi
-    [ "$kind" = verify ] || continue
-    [ "$FM_VERIFY_REC_SHA" = "$sha" ] || continue
-    found=1
-    outcome=$FM_VERIFY_REC_F4
-    steps=$FM_VERIFY_REC_F5
-    case "$outcome" in
-      passed|failed) ;;
-      *)
-        FM_VERIFY_REFUSAL="a verification run recorded for commit $sha has an unreadable outcome ('$outcome')"
-        return 1
-        ;;
-    esac
-    # Precedence (see header): a run that did not pass disqualifies its commit
-    # outright, whatever a later run of the same commit says.
-    [ "$outcome" = passed ] || run_failed=1
-    if [ -z "$steps" ] || [ "$steps" = '-' ]; then
-      continue
-    fi
-    rest=$steps
-    while [ -n "$rest" ]; do
-      pair=$(fm_verify_csv_head "$rest")
-      rest=$(fm_verify_csv_tail "$rest")
-      [ -n "$pair" ] || continue
-      name=${pair%%:*}
-      status=${pair#*:}
-      if [ -z "$name" ] || [ "$name" = "$pair" ]; then
-        FM_VERIFY_REFUSAL="a verification record for commit $sha is malformed and cannot be trusted"
-        return 1
-      fi
-      case "$status" in
-        passed)
-          case "$passed" in
-            *",$name,"*) ;;
-            *) passed="$passed,$name,"; evidence="${evidence:+$evidence,}$name:passed" ;;
-          esac
-          ;;
-        failed)
-          [ -n "$first_failed_step" ] || first_failed_step=$name
-          ;;
-        *)
-          FM_VERIFY_REFUSAL="verification step '$name' has an unreadable result ('$status') for commit $sha"
-          return 1
-          ;;
-      esac
-    done
-  done < "$ledger"
+  fm_verify_ledger_read "$ledger" || return 1
+  fm_verify_tally "$sha" || return 1
+  passed=$FM_VERIFY_T_PASSED
+  evidence=$FM_VERIFY_T_EVIDENCE
+  priors=$FM_VERIFY_T_PRIORS
 
   # Rule 1: some run is bound to this exact commit.
-  if [ "$found" -eq 0 ]; then
+  if [ "$FM_VERIFY_T_FOUND" -eq 0 ]; then
     FM_VERIFY_REFUSAL="no local verification run is recorded for commit $sha (a run on the same branch is not evidence: the branch moves)"
     return 1
   fi
 
   # Rule 2: nothing recorded for this commit failed. Worst outcome wins, so a
   # later passing re-run of the same commit does not erase an earlier failure.
-  if [ -n "$first_failed_step" ] || [ "$run_failed" -eq 1 ]; then
-    if [ -n "$first_failed_step" ]; then
-      why="step '$first_failed_step' is recorded failed"
+  if [ -n "$FM_VERIFY_T_FIRST_FAILED" ] || [ "$FM_VERIFY_T_RUN_FAILED" -eq 1 ]; then
+    if [ -n "$FM_VERIFY_T_FIRST_FAILED" ]; then
+      why="step '$FM_VERIFY_T_FIRST_FAILED' is recorded failed"
     else
       why="a run for this commit is recorded failed"
     fi
@@ -432,7 +1073,8 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
   fi
 
   # Rule 3: a declared step missing from every run was skipped, and skipped is
-  # not passed.
+  # not passed - unless a post-rebase record bound to this commit carries it,
+  # and every POST-REBASE precondition still holds now.
   rest=$required
   while [ -n "$rest" ]; do
     req=$(fm_verify_csv_head "$rest")
@@ -441,26 +1083,38 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
     case "$passed" in
       *",$req,"*) ;;
       *)
-        FM_VERIFY_REFUSAL="required verification step '$req' has no passing record for commit $sha (declared for this project but not run)"
-        return 1
+        [ -n "$first_missing" ] || first_missing=$req
+        missing="${missing:+$missing,}$req"
         ;;
     esac
   done
+  if [ -n "$missing" ]; then
+    if [ -z "$priors" ]; then
+      FM_VERIFY_REFUSAL="required verification step '$first_missing' has no passing record for commit $sha (declared for this project but not run)"
+      return 1
+    fi
+    fm_verify_post_rebase_holds "$sha" "$passed" "$priors" "$required" "$config" "$repo" || return 1
+    evidence="$evidence; post-rebase of $priors, carried: $missing"
+  fi
 
   # Rule 4: any recorded bypass survives unless the exact commit has positive
   # evidence for every step it named. Both durable homes are consulted, because
   # this is the one rule the gate cannot check against evidence of its own. The
-  # ledger's bypasses were collected by the single pass above; neither field can
+  # ledger's bypasses were collected by the single read above; neither field can
   # hold a TAB or a newline, because the split rejects a seventh field and `read`
-  # ends a record at the newline.
-  rest=$bypasses
+  # ends a record at the newline. A carried step is not evidence for this commit,
+  # so it never supersedes a bypass.
+  rest=$FM_VERIFY_BYPASSES
   while [ -n "$rest" ]; do
     line=${rest%%"$FM_VERIFY_NL"*}
     rest=${rest#*"$FM_VERIFY_NL"}
     [ -n "$line" ] || continue
     what=${line%%"$FM_VERIFY_TAB"*}
     why=${line#*"$FM_VERIFY_TAB"}
-    fm_verify_bypass_survives "$what" "$why" "$passed" "$sha" && return 1
+    if fm_verify_bypass_survives "$what" "$why" "$passed" "$sha"; then
+      fm_verify_bypass_carried_note "$missing"
+      return 1
+    fi
   done
 
   if [ -n "$meta" ] && [ -f "$meta" ] && [ ! -L "$meta" ]; then
@@ -476,13 +1130,24 @@ fm_verify_gate() {  # <ledger> <sha> <required-csv> [<meta>]
       else
         why=${value#*|}
       fi
-      fm_verify_bypass_survives "$what" "$why" "$passed" "$sha" && return 1
+      if fm_verify_bypass_survives "$what" "$why" "$passed" "$sha"; then
+        fm_verify_bypass_carried_note "$missing"
+        return 1
+      fi
     done < "$meta"
   fi
 
   # shellcheck disable=SC2034  # Read by the sourcing merge scripts.
   FM_VERIFY_EVIDENCE=$evidence
   return 0
+}
+
+# fm_verify_bypass_carried_note <carried-csv>: when a bypass refuses a commit
+# that carried steps from a post-rebase prior, say why the carried steps did not
+# supersede it, so the refusal does not read as contradicting the prior's pass.
+fm_verify_bypass_carried_note() {  # <carried-csv>
+  [ -n "${1:-}" ] || return 0
+  FM_VERIFY_REFUSAL="$FM_VERIFY_REFUSAL; the steps carried from a post-rebase prior ($1) are not records for this commit, so they never supersede a bypass"
 }
 
 # fm_verify_bypass_survives <what> <why> <passed-set> <sha>: 0 (and sets

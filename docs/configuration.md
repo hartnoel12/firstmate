@@ -137,6 +137,20 @@ Declaring steps raises that project's bar in two places at once.
 `bin/fm-verify.sh run <task-id>` with no arguments runs exactly these steps, and the merge gate then requires every one of them to have a passing record for the commit being merged, so a declared step that never ran is a skipped step and the merge refuses.
 With no declaration the gate still requires a passing run bound to the exact commit, which is the floor rather than the ceiling.
 
+The same file may also declare a post-rebase tier: the steps worth re-running after a rebase of a commit that already holds a full passing record, one `@post-rebase <step> <selector> [<pattern>...]` line per rule.
+
+```
+@post-rebase types always
+@post-rebase mobile if-changed apps/mobile/*
+@post-rebase secrets if-own-changed *
+```
+
+`always` re-runs a step after every rebase, `if-changed` re-runs it when a file matching a pattern differs between the prior commit and the rebased head, and `if-own-changed` narrows that to files the branch itself changes.
+`bin/fm-verify.sh run <task-id> --post-rebase <prior-commit>` runs only that tier and records it as a post-rebase run naming the prior, never as a full pass.
+It is opt-in, and it refuses unless the prior holds a full passing record on the task and the head's own change is the prior's own change and nothing else; the merge gate checks both again before it carries the steps the tier skipped.
+A tier with no `always` step, or one naming an undeclared step, is refused rather than read as no tier.
+`bin/fm-verify-lib.sh`'s POST-REBASE note owns the tier grammar, the rebase test, and the gate contract.
+
 This file is local to each Firstmate home and is not part of secondmate inherited configuration.
 It must be a regular file.
 A path that exists but cannot be read as a declaration, such as a symlink or a directory, is refused by both `bin/fm-verify.sh` and the merge gate rather than treated as "this project declares nothing", because reading it that way would silently drop the project from its declared bar back to the floor.

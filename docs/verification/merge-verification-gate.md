@@ -55,7 +55,7 @@ A gate that cannot be satisfied exactly when it matters most is a gate agents ro
 
 ## Refusals observed firing
 
-Date: 2026-07-26, re-recorded 2026-08-01 when the duplicate-run and bypass-recording cases were added, and 2026-09-02 when the gitignored-cache case was added (first as a refusal, then re-recorded the same day once a captain decision replaced the refusal with a recorded ignored-path digest, since pooled task worktrees legitimately carry ignored content - installed dependencies, local env files - that a refusal could not tell apart from a stale leftover).
+Date: 2026-07-26, re-recorded 2026-08-01 when the duplicate-run and bypass-recording cases were added, 2026-09-02 when the gitignored-cache case was added (first as a refusal, then re-recorded the same day once a captain decision replaced the refusal with a recorded ignored-path digest, since pooled task worktrees legitimately carry ignored content - installed dependencies, local env files - that a refusal could not tell apart from a stale leftover), and 2026-09-21 when the post-rebase tier cases were added.
 Command: `bash tests/fm-merge-verification.test.sh`.
 Each case constructs the failing situation against the real scripts and real git repositories, and asserts that nothing landed - local `main` did not move, or the forge CLI was never asked to merge - rather than asserting on message text.
 
@@ -88,6 +88,14 @@ ok - two passing runs of the same commit still merge
 ok - steps passing across separate runs of one commit combine into one verification
 ok - a bypass is recorded in both durable homes, not just the ledger
 ok - a recorded bypass still refuses when the ledger loses, truncates, or corrupts it
+ok - a rebase-only head verifies with the declared tier, is recorded as post-rebase, and merges on both paths
+ok - a step scoped to the branch's own files re-runs when the rebase changed one of them
+ok - a head that is not merely a rebase is refused, naming the files that differ
+ok - the merge gate re-proves the rebase for itself rather than trusting the prior a record names
+ok - a prior with no full passing record - absent, partial, failed, or post-rebase only - is refused
+ok - the merge gate refuses a post-rebase record whose prior is contradicted, whose tier is incomplete, or whose carried step would be all that covers a bypass
+ok - the post-rebase run keeps the full run's guards and refuses without a declared tier
+ok - a malformed post-rebase tier is refused by both the run and the merge, never read as no tier
 ```
 
 Seven of those cases guard the gate's own record-keeping rather than a merge refusal, and each was watched failing against the pre-fix scripts before being encoded.
@@ -135,6 +143,80 @@ Three changes close it, and each is now covered by a test watched failing agains
 The ledger is parsed strictly: a line that is not exactly six TAB-separated fields, or whose kind is not `verify`, `bypass`, or `override`, refuses rather than being skipped.
 Fields are split without `IFS=$'\t' read`, because TAB is IFS whitespace and `read` folds a run of tabs into one separator, shifting every field after an empty one - which silently turned a bypass's `why` into its `what`.
 And a bypass is written to the task's metadata as well as the ledger, the same second home the override has always had, so losing or damaging either file still leaves the bypass visible.
+
+## Why the post-rebase tier is checked the way it is
+
+Date: 2026-09-21.
+Versions: git 2.43.0, GNU bash 5.2.21 and 3.2.57.
+`bin/fm-verify-lib.sh`'s POST-REBASE note owns the contract; this section holds the evidence that each of its guards is load-bearing.
+
+A narrowed run is only safe while three preconditions hold, so each is enforced twice, by `bin/fm-verify.sh` before any step runs and by the merge gate from the ledger and git at merge time.
+Every one of the eight post-rebase cases in `tests/fm-merge-verification.test.sh` was first watched failing against the pre-change scripts (`git archive HEAD bin` from before the change):
+
+```
+pre-change  test_post_rebase_tier_verifies_and_merges              not ok - full_verify: the full declared run did not pass
+pre-change  test_post_rebase_selects_own_files_the_rebase_changed  not ok - full_verify: the full declared run did not pass
+pre-change  test_post_rebase_refuses_a_head_that_is_not_a_rebase   not ok - full_verify: the full declared run did not pass
+pre-change  test_gate_reproves_the_rebase_itself                   not ok - full_verify: the full declared run did not pass
+pre-change  test_post_rebase_refuses_without_a_full_prior_record   not ok - rebase-never-verified: the refusal did not name the missing full record
+pre-change  test_gate_holds_post_rebase_to_its_prior_and_tier      not ok - full_verify: the full declared run did not pass
+pre-change  test_post_rebase_keeps_the_run_guards                  not ok - full_verify: the full declared run did not pass
+pre-change  test_malformed_tier_refuses_loudly                     not ok - rebase-bad-tier: '@post-rebase ghost always' was not refused as 'post-rebase tier names undeclared step 'ghost''
+```
+
+The pre-change parser rejects the tier lines themselves, so most of those stop at setup.
+Re-run with the tier lines stripped from the fixture, each instead reaches and fails its own assertion, for example `rebase-new-work: the refusal did not say the head is not a rebase`.
+
+Then each guard was disabled on its own, one mutant at a time, and the case that owns it was watched failing:
+
+```
+rebase-test-skipped     not ok - rebase-new-work: a head carrying new work must not verify as a rebase: expected exit 1, got 0
+gate-rebase-ignored     not ok - rebase-forged-prior: the gate did not re-prove the rebase
+context-lines-kept      not ok - rebase-own-file: a clean rebase over a shared file is still a rebase: expected exit 0, got 1
+hunk-offsets-kept       not ok - rebase-own-file: a clean rebase over a shared file is still a rebase: expected exit 0, got 1
+blob-ids-kept           not ok - rebase-own-file: a clean rebase over a shared file is still a rebase: expected exit 0, got 1
+inter-hunk-unpinned     not ok - rebase-own-file: a clean rebase over a shared file is still a rebase: expected exit 0, got 1
+binary-content-dropped  not ok - rebase-binary: different binary content must not verify as a rebase: expected exit 1, got 0
+prior-not-checked       not ok - rebase-partial-prior: a partly verified prior must not anchor the tier: expected exit 1, got 0
+prior-not-checked       not ok - rebase-prior-contradicted: a head whose prior is recorded failed must not merge: expected exit 4, got 0
+carried-anchors         not ok - rebase-chain: a post-rebase-verified prior must not anchor another tier run: expected exit 1, got 0
+gate-trusts-record      not ok - rebase-missing-unit: a post-rebase record without 'unit' must not merge: expected exit 4, got 0
+carried-covers-bypass   not ok - rebase-bypass-carried: a bypass covered only by a carried step must not merge: expected exit 4, got 0
+if-changed-dead         not ok - rebase-merges-local-only: the tier ran 'types unit', expected the always steps plus the two the diff selects
+own-selector-dead       not ok - rebase-own-file: the tier ran 'types unit', expected the always steps plus the own-file step
+always-not-required     not ok - rebase-bad-tier: '@post-rebase types if-changed apps/*' should refuse the run: expected exit 1, got 0
+```
+
+Two of those guards exist because a plain diff gets the rebase test wrong in the unsafe direction.
+Without `--binary`, two different binary changes both render as one identical `Binary files ... differ` line and compare equal.
+And `-U0` alone does not remove the upstream's lines from the branch's hunks, because `diff.interHunkContext` is an ordinary user setting that merges nearby hunks and pulls the lines between them back in:
+
+```
+$ git -c diff.interHunkContext=10 diff -U0 HEAD~1 HEAD -- y
+@@ -1,6 +1,6 @@
+-l1
++lA
+ l2
+ l3
+ l4
+ l5
+-l6
++lB
+$ git -c diff.interHunkContext=10 diff -U0 --inter-hunk-context=0 HEAD~1 HEAD -- y
+@@ -1 +1 @@
+-l1
++lA
+@@ -6 +6 @@ l5
+-l6
++lB
+```
+
+The whole file, pre-existing and post-rebase cases together, passes under GNU bash 3.2.57 built from the release tarball, with every script resolving `bash` to that interpreter through `PATH`:
+
+```
+$ PATH=<bash-3.2.57 dir>:$PATH bash tests/fm-merge-verification.test.sh
+... 36 lines, every one "ok - ..."
+```
 
 ## Scope of the guarantee
 
