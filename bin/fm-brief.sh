@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Scaffold a crewmate brief or persistent secondmate charter at
 # data/<task-id>/brief.md under the active firstmate home.
-# For ordinary tasks, the standard Setup/Rules/Definition-of-done contract is
-# filled in. Firstmate then replaces the {TASK} placeholder with the task
-# description, acceptance criteria, and context, and may adjust other sections
-# when the task genuinely deviates (e.g. working an existing external PR instead
-# of shipping a new one).
+# For ordinary tasks, the standard Setup/Rules/Verification/Definition-of-done
+# contract is filled in. Firstmate then replaces the {TASK} placeholder with the
+# task description, acceptance criteria, and context, and may adjust other
+# sections when the task genuinely deviates (e.g. working an existing external
+# PR instead of shipping a new one).
+# Ship briefs fold config/verify/<project>'s declared commands (falling back to
+# package.json scripts, then to an honesty requirement) into a Verification
+# section: see "Merge verification evidence" in docs/configuration.md for the
+# declaration format.
 # Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
@@ -288,6 +292,104 @@ read -r MODE _ <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
 EOF
 
+# Declared verification: fold the project's own config/verify/<project> commands
+# (docs/configuration.md "Merge verification evidence") into the brief so the
+# crew reports against the same bar firstmate's own merge gate checks, instead
+# of the ambiguous no-mistakes pipeline test step. See data/learnings.md
+# 2026-09-21 and fm-brief-must-require-declared-verification: the remedy lived
+# in that file alone for weeks and reached zero call sites.
+# shellcheck source=bin/fm-verify-lib.sh
+. "$SCRIPT_DIR/fm-verify-lib.sh"
+
+VERIFY_FILE=$(fm_verify_config_path "$FM_HOME/config" "$REPO")
+VERIFY_FILE_EXISTS=0
+STEPS_LIST=""
+if [ -n "$VERIFY_FILE" ] && [ -e "$VERIFY_FILE" ]; then
+  VERIFY_FILE_EXISTS=1
+  VERIFY_STEPS=$(fm_verify_config_steps "$VERIFY_FILE") || {
+    echo "error: $VERIFY_FILE: invalid verification declaration" >&2
+    exit 1
+  }
+  while IFS="$FM_VERIFY_TAB" read -r VNAME VCMD; do
+    [ -n "$VNAME" ] || continue
+    STEPS_LIST="${STEPS_LIST}- \`$VNAME\`: \`$VCMD\`
+"
+  done <<VERIFYSTEPS
+$VERIFY_STEPS
+VERIFYSTEPS
+fi
+
+# No declaration: fall back to naming the project's own package.json scripts,
+# when discoverable, rather than leaving the crew with nothing concrete to run.
+project_scripts() {
+  local pkg="$FM_HOME/projects/$REPO/package.json" in_scripts=0 line key
+  [ -f "$pkg" ] || return 0
+  while IFS= read -r line; do
+    if [ "$in_scripts" -eq 0 ]; then
+      case "$line" in
+        *'"scripts"'*'{'*) in_scripts=1 ;;
+      esac
+      continue
+    fi
+    case "$line" in
+      *'}'*) break ;;
+    esac
+    key=$(printf '%s' "$line" | sed -n 's/^[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$key" ] && printf '%s\n' "$key"
+  done < "$pkg"
+}
+
+SCRIPTS_LIST=""
+if [ -z "$STEPS_LIST" ]; then
+  while IFS= read -r SNAME; do
+    [ -n "$SNAME" ] || continue
+    SCRIPTS_LIST="${SCRIPTS_LIST}- \`npm run $SNAME\`
+"
+  done < <(project_scripts)
+fi
+
+verify_section_declared() {
+  cat <<EOF
+# Verification
+This project declares its own verification at \`$VERIFY_FILE\`.
+Before reporting done, run every one of these commands yourself from the worktree root, in full, and report the real result:
+$STEPS_LIST
+This is the same bar firstmate's own merge gate checks at the PR head; do not report "local verification passed" without having actually run these.
+If any of them fail, say so plainly in your done line and fix them before reporting done, rather than deferring to the no-mistakes pipeline's test step, which does not measure the same thing.
+EOF
+}
+
+verify_section_scripts() {
+  local declaration_state="declares no verification file at config/verify/$REPO"
+  [ "$VERIFY_FILE_EXISTS" -eq 1 ] && declaration_state="declares a verification file at \`$VERIFY_FILE\` with no steps in it"
+  cat <<EOF
+# Verification
+This project $declaration_state, but its \`package.json\` has these scripts:
+$SCRIPTS_LIST
+Before reporting done, run whichever of these actually verify your change (typically the test, lint, and type-check scripts), and report the real result rather than "local verification passed" as boilerplate.
+The no-mistakes pipeline's test step does not measure the same thing as these; do not treat a green pipeline step as equivalent to having run them.
+EOF
+}
+
+verify_section_none() {
+  local declaration_state="declares no verification file at config/verify/$REPO"
+  [ "$VERIFY_FILE_EXISTS" -eq 1 ] && declaration_state="declares a verification file at \`$VERIFY_FILE\` with no steps in it"
+  cat <<EOF
+# Verification
+This project $declaration_state and has no discoverable check scripts.
+Before reporting done, state in your done line exactly which commands you ran to verify your change and their real pass/fail result.
+Never report "local verification passed" without naming the commands; the no-mistakes pipeline's test step does not measure the same thing.
+EOF
+}
+
+if [ -n "$STEPS_LIST" ]; then
+  VERIFY_SECTION=$(verify_section_declared)
+elif [ -n "$SCRIPTS_LIST" ]; then
+  VERIFY_SECTION=$(verify_section_scripts)
+else
+  VERIFY_SECTION=$(verify_section_none)
+fi
+
 # One function per delivery mode's Definition of done. These bodies are prose and
 # will keep growing apostrophes, so they must never move back inline into
 # `DOD=$(cat <<EOF ...)`: see the heredoc rule above and bin/fm-bash-syntax-check.sh.
@@ -324,12 +426,15 @@ Follow the guidance no-mistakes itself provides for the mechanics: it loads when
 Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
 
 Two firstmate-specific rules layer on top of that guidance:
-- ask-user findings are never yours to answer: escalate to firstmate (rule 6) and stop.
+- ask-user findings are never yours to answer: escalate to firstmate (rule 7) and stop.
   Firstmate applies the authority contract in its \`AGENTS.md\` and obtains any required captain decision.
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - Avoid \`--yes\`: it would silently bypass firstmate's authority check and any required captain escalation.
 
-After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
+Before you report done, complete the Verification section below: no-mistakes' pipeline test step and your own declared verification measure different things, and only the latter is the merge gate's evidence.
+When /no-mistakes reaches its CI-ready return point (do not wait for it to keep monitoring in the background until merge), report the CI outcome you actually observed: append \`done: PR {url} checks green\` only if CI genuinely reported every check green.
+If CI is dark, skipped, or still running for reasons outside your control, append \`done: PR {url}\` followed by the exact CI state you saw instead of claiming checks green.
+Never copy "checks green" as boilerplate.
 EOF
 }
 
@@ -371,9 +476,10 @@ If the top-level path is the primary checkout or not the worktree you were launc
 
 # Rules
 $RULE1
-2. Stay inside this worktree; modify nothing outside it.
-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
-4. Report status by appending one line:
+2. Never add an agent name as a commit co-author trailer (for example a \`Co-Authored-By: <agent>\` line). Your harness may inject its own attribution guidance into this session; override it and leave every commit on this branch without one.
+3. Stay inside this worktree; modify nothing outside it.
+4. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+5. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
@@ -386,13 +492,15 @@ $RULE1
    known external wait you expect to clear on its own (an upstream release, a rate-limit reset,
    a scheduled window): firstmate then leaves your idle pane alone and rechecks it on a long
    cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
-5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
-6. If a decision belongs above the implementation worker (product choices, destructive actions, ask-user findings),
+6. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
+7. If a decision belongs above the implementation worker (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will apply the configured authority and reply with the decision.
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
+8. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+
+$VERIFY_SECTION
 
 # Project memory
 If this task produced durable project-intrinsic knowledge, route it to a skill first, \`AGENTS.md\` only for the rest.

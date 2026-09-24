@@ -13,7 +13,11 @@
 # on every wake. Printed reason lines:
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
 #                          has a captain-relevant verb OR a no-verb signal's crew
-#                          is not provably working, unless afk is active
+#                          is not provably working, unless afk is active. A bare
+#                          turn-end for a window already parked under a still-
+#                          unsuperseded pause is dropped silently instead (see
+#                          drop_parked_turnends), since the pause path already
+#                          owns that window's resurfacing.
 #   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
 #                          timer) regardless of what the status log says - an active
 #                          run-step or busy pane outranks even a captain-relevant log
@@ -449,6 +453,48 @@ mark_signalled_pauses_shown() {  # <signal-file> ...
   done
 }
 
+# A parked crew's harness re-touches its own turn-end marker every
+# monitor-driven turn while its last status line still declares the same
+# standing pause; that turn-end carries no information the pause does not
+# already carry (mark_signalled_pauses_shown above owns the equivalent case for
+# a surfaced status signal). Once pause_is_parked already trusts the window -
+# the stale layer or a prior signal has already shown firstmate this park - a
+# bare *.turn-ended pending entry for it is dropped from this batch instead of
+# waking on it, its .seen-* marker still advanced so it does not resurface.
+# A busy pane supersedes the park exactly as it does for the stale layer, and a
+# companion *.status change in the same batch is untouched: only a bare
+# turn-end for an already-parked, still-paused window is ever dropped, and a
+# crew whose pause is superseded (a new non-paused status, or a busy pane)
+# keeps surfacing normally. Not called under away mode, where the daemon rather
+# than firstmate triages the signal. Reads pending TSV on stdin, prints the
+# filtered TSV.
+drop_parked_turnends() {  # stdin: pending TSV; prints the filtered TSV
+  local sf sig f task w tail40 drop
+  while IFS=$(printf '\t') read -r sf sig f; do
+    [ -n "$sf" ] || continue
+    drop=0
+    case "$f" in
+      *.turn-ended)
+        task=$(basename "$f" .turn-ended)
+        if status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" \
+          && [ -e "$STATE/$task.meta" ] \
+          && w=$(fm_backend_target_of_meta "$STATE/$task.meta") && [ -n "$w" ] \
+          && pause_is_parked "$w"; then
+          if tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null); then
+            window_is_busy "$w" "$tail40" || drop=1
+          fi
+        fi
+        ;;
+    esac
+    if [ "$drop" -eq 1 ]; then
+      printf '%s' "$sig" > "$sf"
+      triage_log "absorbed parked turn-end: $f"
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "$sf" "$sig" "$f"
+  done
+}
+
 # Check and heartbeat cadence must survive actionable exits and restarts: the
 # watcher may be relaunched before in-memory counters reach their threshold on a
 # busy fleet. Persist the schedule as file mtimes instead.
@@ -829,6 +875,13 @@ while :; do
   if [ -n "$pending" ]; then
     sleep "$SIGNAL_GRACE"
     pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
+    # A parked crew's turn-end churn carries no information its standing pause
+    # does not already carry; drop_parked_turnends absorbs it silently unless
+    # the park has been superseded. Skipped under away mode, where the daemon
+    # owns triage. May empty the batch entirely, so re-check before building it.
+    afk_present || pending=$(printf '%s\n' "$pending" | drop_parked_turnends)
+  fi
+  if [ -n "$pending" ]; then
     files=""
     while IFS=$(printf '\t') read -r sf sig f; do
       [ -n "$sf" ] || continue

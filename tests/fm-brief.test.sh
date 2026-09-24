@@ -82,6 +82,23 @@ test_ship_modes_generate_clean_briefs() {
   pass "fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly"
 }
 
+# brief-forbid-agent-coauthor: every ship brief must explicitly forbid an
+# agent-name commit co-author trailer, since the crewmate harness may inject
+# its own attribution guidance and the scaffold did not previously override it.
+test_ship_rules_forbid_agent_coauthor() {
+  local home id brief
+  home="$TMP_ROOT/coauthor-home"
+  mkdir -p "$home/data"
+  id="brief-coauthor-f1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "brief was not scaffolded"
+  # shellcheck disable=SC2016  # backticks must render literally
+  assert_grep 'Never add an agent name as a commit co-author trailer (for example a `Co-Authored-By: <agent>` line).' "$brief" \
+    "brief did not forbid an agent-name commit co-author trailer"
+  pass "fm-brief.sh: ship rules forbid an agent-name commit co-author trailer"
+}
+
 test_faster_paths_use_configured_authority_without_stacked_review() {
   local home id brief
   home="$TMP_ROOT/configured-authority-home"
@@ -160,6 +177,76 @@ test_ship_project_memory_wording() {
   assert_grep "lacks \`## Maintaining this file\`, add that short self-governance section" "$brief" \
     "project-memory contract lost the self-governance add-in-same-pass rule"
   pass "fm-brief.sh: ship project-memory wording defaults durable knowledge to a skill"
+}
+
+# fm-brief-must-require-declared-verification: the generated brief must fold a
+# project's config/verify/<project> commands (docs/configuration.md "Merge
+# verification evidence") into the Verification section, fall back to
+# discoverable package.json scripts when no declaration exists, and otherwise
+# tell the crew to state exactly which commands it ran. The done-line wording
+# must not force an unconditional "checks green" claim.
+test_ship_declared_verification_wording() {
+  local home id brief
+  home="$TMP_ROOT/verify-declared-home"
+  mkdir -p "$home/data" "$home/config/verify"
+  cat > "$home/config/verify/declared-proj" <<'EOF'
+tests = bin/fm-test-run.sh --all
+lint = bin/fm-lint.sh
+EOF
+  id="brief-verify-declared-e1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" declared-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "brief was not scaffolded"
+  assert_grep "# Verification" "$brief" "brief lost its Verification section"
+  assert_grep "declares its own verification at \`$home/config/verify/declared-proj\`" "$brief" \
+    "brief did not name the declared verification file"
+  # shellcheck disable=SC2016  # backticks must render literally
+  assert_grep '`tests`: `bin/fm-test-run.sh --all`' "$brief" \
+    "brief did not render the declared tests command"
+  # shellcheck disable=SC2016  # backticks must render literally
+  assert_grep '`lint`: `bin/fm-lint.sh`' "$brief" \
+    "brief did not render the declared lint command"
+  assert_grep 'do not report "local verification passed" without having actually run these' "$brief" \
+    "brief did not require an honest verification claim"
+
+  home="$TMP_ROOT/verify-scripts-home"
+  mkdir -p "$home/data" "$home/projects/scripts-proj"
+  cat > "$home/projects/scripts-proj/package.json" <<'EOF'
+{
+  "name": "scripts-proj",
+  "scripts": {
+    "test": "jest",
+    "lint": "eslint ."
+  }
+}
+EOF
+  id="brief-verify-scripts-e2"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" scripts-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  # shellcheck disable=SC2016  # backticks must render literally
+  assert_grep 'its `package.json` has these scripts:' "$brief" \
+    "brief did not fall back to discoverable package.json scripts"
+  # shellcheck disable=SC2016  # backticks must render literally
+  assert_grep '`npm run test`' "$brief" "brief did not list the discovered test script"
+  # shellcheck disable=SC2016  # backticks must render literally
+  assert_grep '`npm run lint`' "$brief" "brief did not list the discovered lint script"
+
+  home="$TMP_ROOT/verify-none-home"
+  mkdir -p "$home/data"
+  id="brief-verify-none-e3"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" no-decl-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_grep "declares no verification file at config/verify/no-decl-proj and has no discoverable check scripts" "$brief" \
+    "brief did not fall back to the state-your-commands instruction"
+  assert_grep "Never report \"local verification passed\" without naming the commands" "$brief" \
+    "brief lost the honesty requirement in the no-declaration fallback"
+
+  assert_grep 'only if CI genuinely reported every check green' "$brief" \
+    "brief still forces an unconditional checks-green claim"
+  # shellcheck disable=SC2016  # backticks must render literally
+  assert_no_grep 'append `done: PR {url} checks green` and stop. You are finished.' "$brief" \
+    "brief kept the old unconditional checks-green done line"
+  pass "fm-brief.sh: declared verification is required, with package.json and honesty fallbacks, and the done line is no longer unconditional"
 }
 
 test_herdr_lab_contract_is_explicit_and_complete() {
@@ -411,8 +498,10 @@ test_scout_and_secondmate_scaffold() {
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
+test_ship_rules_forbid_agent_coauthor
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
+test_ship_declared_verification_wording
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
