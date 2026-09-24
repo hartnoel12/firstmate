@@ -476,8 +476,9 @@ drop_parked_turnends() {  # stdin: pending TSV; prints the filtered TSV
           && [ -e "$STATE/$task.meta" ] \
           && w=$(fm_backend_target_of_meta "$STATE/$task.meta") && [ -n "$w" ] \
           && pause_is_parked "$w"; then
-          tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || tail40=""
-          window_is_busy "$w" "$tail40" || drop=1
+          if tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null); then
+            window_is_busy "$w" "$tail40" || drop=1
+          fi
         fi
         ;;
     esac

@@ -298,8 +298,10 @@ EOF
 . "$SCRIPT_DIR/fm-verify-lib.sh"
 
 VERIFY_FILE=$(fm_verify_config_path "$FM_HOME/config" "$REPO")
+VERIFY_FILE_EXISTS=0
 STEPS_LIST=""
 if [ -n "$VERIFY_FILE" ] && [ -e "$VERIFY_FILE" ]; then
+  VERIFY_FILE_EXISTS=1
   VERIFY_STEPS=$(fm_verify_config_steps "$VERIFY_FILE") || {
     echo "error: $VERIFY_FILE: invalid verification declaration" >&2
     exit 1
@@ -354,9 +356,11 @@ EOF
 }
 
 verify_section_scripts() {
+  local declaration_state="declares no verification file at config/verify/$REPO"
+  [ "$VERIFY_FILE_EXISTS" -eq 1 ] && declaration_state="declares a verification file at \`$VERIFY_FILE\` with no steps in it"
   cat <<EOF
 # Verification
-This project declares no verification file at config/verify/$REPO, but its \`package.json\` has these scripts:
+This project $declaration_state, but its \`package.json\` has these scripts:
 $SCRIPTS_LIST
 Before reporting done, run whichever of these actually verify your change (typically the test, lint, and type-check scripts), and report the real result rather than "local verification passed" as boilerplate.
 The no-mistakes pipeline's test step does not measure the same thing as these; do not treat a green pipeline step as equivalent to having run them.
@@ -364,9 +368,11 @@ EOF
 }
 
 verify_section_none() {
+  local declaration_state="declares no verification file at config/verify/$REPO"
+  [ "$VERIFY_FILE_EXISTS" -eq 1 ] && declaration_state="declares a verification file at \`$VERIFY_FILE\` with no steps in it"
   cat <<EOF
 # Verification
-This project declares no verification file at config/verify/$REPO and has no discoverable check scripts.
+This project $declaration_state and has no discoverable check scripts.
 Before reporting done, state in your done line exactly which commands you ran to verify your change and their real pass/fail result.
 Never report "local verification passed" without naming the commands; the no-mistakes pipeline's test step does not measure the same thing.
 EOF
