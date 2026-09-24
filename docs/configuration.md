@@ -133,9 +133,10 @@ test = npm test
 lint = npm run lint
 ```
 
-Declaring steps raises that project's bar in two places at once.
+Declaring steps raises that project's bar in two enforced places and one advisory one.
 `bin/fm-verify.sh run <task-id>` with no arguments runs exactly these steps, and the merge gate then requires every one of them to have a passing record for the commit being merged, so a declared step that never ran is a skipped step and the merge refuses.
 With no declaration the gate still requires a passing run bound to the exact commit, which is the floor rather than the ceiling.
+`bin/fm-brief.sh` also folds these exact commands into the ship brief's Verification section so a crew is told to run the same bar the merge gate checks, falling back to the project's `package.json` scripts and then to an explicit honesty requirement when no declaration or scripts exist; this consumer is advisory prose and enforces nothing itself.
 
 The same file may also declare a post-rebase tier: the steps worth re-running after a rebase of a commit that already holds a full passing record, one `@post-rebase <step> <selector> [<pattern>...]` line per rule.
 

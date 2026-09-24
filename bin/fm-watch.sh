@@ -13,7 +13,11 @@
 # on every wake. Printed reason lines:
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
 #                          has a captain-relevant verb OR a no-verb signal's crew
-#                          is not provably working, unless afk is active
+#                          is not provably working, unless afk is active. A bare
+#                          turn-end for a window already parked under a still-
+#                          unsuperseded pause is dropped silently instead (see
+#                          drop_parked_turnends), since the pause path already
+#                          owns that window's resurfacing.
 #   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
 #                          timer) regardless of what the status log says - an active
 #                          run-step or busy pane outranks even a captain-relevant log

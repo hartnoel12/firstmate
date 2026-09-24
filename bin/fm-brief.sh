@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Scaffold a crewmate brief or persistent secondmate charter at
 # data/<task-id>/brief.md under the active firstmate home.
-# For ordinary tasks, the standard Setup/Rules/Definition-of-done contract is
-# filled in. Firstmate then replaces the {TASK} placeholder with the task
-# description, acceptance criteria, and context, and may adjust other sections
-# when the task genuinely deviates (e.g. working an existing external PR instead
-# of shipping a new one).
+# For ordinary tasks, the standard Setup/Rules/Verification/Definition-of-done
+# contract is filled in. Firstmate then replaces the {TASK} placeholder with the
+# task description, acceptance criteria, and context, and may adjust other
+# sections when the task genuinely deviates (e.g. working an existing external
+# PR instead of shipping a new one).
+# Ship briefs fold config/verify/<project>'s declared commands (falling back to
+# package.json scripts, then to an honesty requirement) into a Verification
+# section: see "Merge verification evidence" in docs/configuration.md for the
+# declaration format.
 # Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
