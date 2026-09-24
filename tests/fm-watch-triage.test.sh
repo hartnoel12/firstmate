@@ -362,6 +362,88 @@ test_turn_ended_not_working_surfaced() {
   pass "a bare turn-end whose crew is not provably working is surfaced (the swallowed-finish fix)"
 }
 
+# --- a parked crew's own turn-end churn is silent between long-cadence
+#     resurfaces (fm-parked-crew-turnend-signal-still-surfaces) -----------------
+# The residual left by the paused-stale fix above: a crew already shown parked
+# under a live pause marker still woke firstmate once per monitor-driven turn,
+# because the signal layer (status/turn-ended file changes) never consulted the
+# pause the stale layer already trusts. drop_parked_turnends is the fix.
+
+test_turn_ended_parked_pause_absorbed() {
+  local dir state fakebin out capture_file window key statusf sig pid
+  dir=$(make_case turn-ended-parked-pause); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-parked"
+  printf 'idle, holding for upstream' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/held.meta"
+  statusf="$state/held.status"
+  printf 'paused: holding for the upstream tool release\n' > "$statusf"
+  # .seen-* primed so the unchanged status file does not itself signal; only the
+  # fresh turn-ended file below is new this poll.
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-held_status"
+  : > "$state/held.turn-ended"
+  # A live pause marker with a fresh recheck: firstmate has already been shown
+  # this crew parked (by the stale layer or an earlier signal), which is exactly
+  # what pause_is_parked trusts.
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  : > "$state/.paused-$key"
+  date +%s > "$state/.paused-rechecked-$key"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · holding for the upstream tool release'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher exited for a parked crew's own turn-end (should absorb): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "a parked crew's turn-end printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "a parked crew's turn-end enqueued a durable wake record"
+  [ -s "$state/.seen-held_turn-ended" ] || fail "a parked crew's turn-end did not advance its .seen-* suppressor"
+  grep -F "absorbed parked turn-end" "$state/.watch-triage.log" >/dev/null 2>&1 \
+    || fail "a parked crew's turn-end was not logged as absorbed"
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a parked crew's own turn-end is absorbed between long-cadence resurfaces, no wake"
+}
+
+test_turn_ended_parked_pause_superseded_by_busy_pane_surfaces() {
+  local dir state fakebin out drain_out capture_file window key statusf sig pid
+  dir=$(make_case turn-ended-parked-pause-busy); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-parked-busy"
+  # A busy-looking pane supersedes the park exactly as it does for the stale
+  # layer: the crew resumed without having written a fresh status yet.
+  printf 'esc to interrupt' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/held.meta"
+  statusf="$state/held.status"
+  printf 'paused: holding for the upstream tool release\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-held_status"
+  : > "$state/held.turn-ended"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  : > "$state/.paused-$key"
+  date +%s > "$state/.paused-rechecked-$key"
+  # The pane capture text alone drives drop_parked_turnends' busy check; the
+  # authoritative crew-state fake stays unknown (not provably working) so the
+  # signal, once kept by the busy-pane bypass, surfaces through the ordinary
+  # not-provably-working path exactly like test_turn_ended_not_working_surfaced.
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a parked crew's turn-end once the pane went busy"
+  grep -F "signal: $state/held.turn-ended" "$out" >/dev/null || fail "watcher did not print the superseded turn-end signal"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the superseded turn-end failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$state/held.turn-ended" >/dev/null \
+    || fail "superseded turn-end was not queued"
+  unset FM_FAKE_CREW_STATE
+  pass "a parked crew's turn-end surfaces normally once a busy pane supersedes the pause"
+}
+
 test_working_note_not_working_surfaced() {
   local dir state fakebin out drain_out status_file pid
   dir=$(make_case working-note-stopped); state="$dir/state"; fakebin="$dir/fakebin"
@@ -1520,6 +1602,8 @@ test_signal_crew_provably_working_classifier
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced
+test_turn_ended_parked_pause_absorbed
+test_turn_ended_parked_pause_superseded_by_busy_pane_surfaces
 test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
 test_terminal_stale_surfaced
