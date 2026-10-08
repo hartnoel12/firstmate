@@ -30,7 +30,7 @@
 # nothing about the fleet. --require-bash32 exists to make that failure loud:
 # without it a CI job can silently degrade to a newer Bash and pass vacuously.
 #
-# The file set comes from `bin/fm-lint.sh --list-roots`, the single owner of
+# The file set comes from `bin/fm-lint.sh --list-files`, the single owner of
 # firstmate's canonical shell roots, so the two checks cannot drift apart.
 #
 # Usage:
@@ -91,8 +91,10 @@ fi
 
 printf 'fm-bash-syntax-check.sh: %s (Bash %s)\n' "$BASH_BIN" "$VERSION" >&2
 
-ROOTS=$("$SELF_DIR/fm-lint.sh" --list-roots) || {
-  printf 'fm-bash-syntax-check.sh: could not read the canonical root set from fm-lint.sh --list-roots.\n' >&2
+# CI=true selects the complete inventory; without it fm-lint.sh may narrow
+# --list-files to the files changed on this branch.
+ROOTS=$(CI=true "$SELF_DIR/fm-lint.sh" --list-files) || {
+  printf 'fm-bash-syntax-check.sh: could not read the canonical root set from fm-lint.sh --list-files.\n' >&2
   exit 2
 }
 

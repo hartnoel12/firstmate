@@ -54,9 +54,31 @@ make_case() {  # <name> <id>
   wt="$case_dir/wt"
   mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
   fm_git_worktree "$proj" "$wt" "wt-$name"
-  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  cat > "$home/data/$id/brief.md" <<EOF
+# Task
+## Captain's intent
+Reuse a pooled worktree slot for $id.
+
+## Firstmate spec
+Leave no previous occupant's turn-end hook behind.
+EOF
   touch "$home/state/.last-watcher-beat"
   printf '%s\n' "$case_dir"
+}
+
+# Hide <rel>... from git the way the occupant's own spawn did (fm-spawn.sh's
+# exclude_path). A leftover hook is invisible to `git status` for exactly this
+# reason, which is how it gets past the pooled-worktree cleanliness check that
+# refuses a dirty slot and survives into the next task.
+exclude_like_spawn() {  # <worktree> <rel>...
+  local wt=$1 excl rel
+  shift
+  excl=$(git -C "$wt" rev-parse --git-path info/exclude)
+  case "$excl" in /*) ;; *) excl="$wt/$excl" ;; esac
+  mkdir -p "$(dirname "$excl")"
+  for rel in "$@"; do
+    grep -qxF "$rel" "$excl" 2>/dev/null || printf '%s\n' "$rel" >> "$excl"
+  done
 }
 
 # Plant the previous occupant's hook file, byte-for-byte the shape fm-spawn
@@ -68,6 +90,7 @@ plant_dead_claude_hook() {  # <case_dir>
   printf '%s\n' \
     "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"touch '$signal'\"}]}]}}" \
     > "$case_dir/wt/.claude/settings.local.json"
+  exclude_like_spawn "$case_dir/wt" .claude/settings.local.json
   printf '%s\n' "$signal"
 }
 
@@ -87,15 +110,16 @@ hook_fires_for_dead_task() {  # <case_dir> <hook-file>
 
 run_spawn() {  # <case_dir> <id> <harness>
   local case_dir=$1 id=$2 harness=$3
-  FM_ROOT_OVERRIDE="$case_dir/home" \
+  FM_ROOT_OVERRIDE='' \
   FM_HOME="$case_dir/home" \
   FM_STATE_OVERRIDE="$case_dir/home/state" \
   FM_DATA_OVERRIDE="$case_dir/home/data" \
+  FM_PROJECTS_OVERRIDE="$case_dir/home/projects" \
   FM_CONFIG_OVERRIDE="$case_dir/home/config" \
   FM_BACKEND=tmux \
   FM_SPAWN_NO_GUARD=1 \
   PATH="$case_dir/fake/fakebin:$PATH" \
-    "$SPAWN" "$id" "$case_dir/project" --harness "$harness" \
+    "$SPAWN" "$id" "$case_dir/project" --harness "$harness" --mode no-mistakes --yolo off \
     > "$case_dir/spawn.out" 2> "$case_dir/spawn.err"
 }
 
@@ -141,6 +165,7 @@ test_every_worktree_hook_artifact_is_scrubbed() {
     > "$case_dir/wt/.opencode/plugins/fm-turn-end.js"
   printf 'token=fm.aaaaaaaaaaaa\n' > "$case_dir/wt/.fm-grok-turnend"
   printf 'token=fm.bbbbbbbbbbbb\n' > "$case_dir/wt/.fm-kimi-turnend"
+  exclude_like_spawn "$case_dir/wt" .opencode/plugins/fm-turn-end.js .fm-grok-turnend .fm-kimi-turnend
 
   set +e
   run_spawn "$case_dir" fresh-x2 codex
@@ -190,6 +215,7 @@ test_project_owned_settings_file_is_left_alone() {
   hook="$case_dir/wt/.claude/settings.local.json"
   mkdir -p "$case_dir/wt/.claude"
   printf '%s\n' '{"permissions":{"allow":["Bash(ls:*)"]}}' > "$hook"
+  exclude_like_spawn "$case_dir/wt" .claude/settings.local.json
 
   set +e
   run_spawn "$case_dir" fresh-x4 codex
@@ -212,8 +238,14 @@ test_committed_hook_is_reported_not_deleted() {
   make_fakebin "$case_dir/fake" "$case_dir/wt" >/dev/null
   hook="$case_dir/wt/.claude/settings.local.json"
   plant_dead_claude_hook "$case_dir" >/dev/null
-  git -C "$case_dir/wt" add -f .claude/settings.local.json
-  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -qm "committed hook"
+  # Committed on the project's own published base, so the hook is still there
+  # after spawn refreshes the pooled worktree onto that base.
+  mkdir -p "$case_dir/project/.claude"
+  mv "$hook" "$case_dir/project/.claude/settings.local.json"
+  git -C "$case_dir/project" add -f .claude/settings.local.json
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -qm "committed hook"
+  git -C "$case_dir/project" push -q origin HEAD:main
+  git -C "$case_dir/wt" reset -q --hard "$(git -C "$case_dir/project" rev-parse HEAD)"
 
   set +e
   run_spawn "$case_dir" fresh-x5 codex

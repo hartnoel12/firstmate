@@ -28,7 +28,7 @@ make_fixture() {  # <name>
   chmod +x "$fix/bin/fm-bash-syntax-check.sh"
   cat > "$fix/bin/fm-lint.sh" <<'STUB'
 #!/usr/bin/env bash
-[ "${1:-}" = "--list-roots" ] || exit 2
+[ "${1:-}" = "--list-files" ] || exit 2
 cd "$(dirname "$0")/.." || exit 1
 printf '%s\n' bin/*.sh
 STUB

@@ -29,8 +29,9 @@
 #       separately records (rather than refuses) a worktree carrying
 #       gitignored untracked content, with a digest of that content alongside
 #       the result
-#   (n) the PR head is the anchor, and a head the forge cannot report refuses
-#   (o) a returned worktree does not turn the honest path into an override
+#   (n) the PR head the live forge read verified is the anchor, and a head the
+#       forge cannot report refuses before that read
+#   (o) a returned worktree refuses, and is never presented as an override
 #   (p) the override's metadata note leaves the task's PR metadata parseable;
 #       an override whose record cannot be written is refused rather than taken
 #       on a half-written file; and a repeat override or a backslash in the
@@ -104,22 +105,52 @@ make_case() {  # <name> <mode>
     "mode=$mode"
   chmod 600 "$case_dir/state/task-x1.meta"
 
+  # The PR merge reads its captain hold through the home's task backend.
+  mkdir -p "$case_dir/data"
+  cp "$ROOT/.tasks.toml" "$case_dir/.tasks.toml"
+  printf '%s\n' '## In flight' '' '## Queued' '' '## Done' > "$case_dir/data/backlog.md"
+
   # gh answers the PR head from a file the test controls, so "the PR moved" and
-  # "the forge cannot say" are both expressible.
+  # "the forge cannot say" are both expressible. Every other live condition
+  # bin/fm-pr-merge.sh reads is green, on an unprotected base with no merge
+  # queue, so the local verification gate is the only thing a case can trip.
+  # The merge itself is logged to the same file as gh-axi's calls.
   git -C "$wt" rev-parse HEAD > "$case_dir/pr-head"
   cat > "$bin/gh" <<'SH'
 #!/usr/bin/env bash
+head=
+[ ! -s "$FM_TEST_PR_HEAD" ] || head=$(cat "$FM_TEST_PR_HEAD")
 case "${1:-} ${2:-}" in
   "pr view")
     case " $* " in
-      *headRefOid*) [ -s "$FM_TEST_PR_HEAD" ] && cat "$FM_TEST_PR_HEAD"; exit 0 ;;
+      *statusCheckRollup*)
+        printf '{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"%s","baseRefName":"main","statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}\n' "$head"
+        exit 0 ;;
+      *headRefOid*) [ -z "$head" ] || printf '%s\n' "$head"; exit 0 ;;
     esac ;;
+  "pr merge")
+    printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+    exit 0 ;;
+  "api graphql")
+    printf '%s\n' 'state=MERGED' 'merged=true' 'queued=false' 'base=main'
+    exit 0 ;;
+  api\ *)
+    case " $* " in
+      *" repos/"*"/rules/branches/"*merge_queue*) ;;
+      *" repos/"*"/rules/branches/"*) printf '[{"type":"deletion"}]\n' ;;
+      *" repos/"*"/branches/"*)
+        printf '{"name":"main","protected":false,"protection":{"enabled":false,"required_status_checks":{"enforcement_level":"off","contexts":[],"checks":[]}}}\n' ;;
+    esac
+    exit 0 ;;
 esac
 exit 0
 SH
   cat > "$bin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+case "${1:-} ${2:-}" in
+  "pr view") printf 'pull_request:\n  number: %s\n  state: merged\n' "${3:-}" ;;
+esac
 exit 0
 SH
   chmod +x "$bin/gh" "$bin/gh-axi"
@@ -159,7 +190,7 @@ assert_not_merged_local() {  # <case_dir> <before> <msg>
   [ "$(main_of "$1")" = "$2" ] || fail "$3"
 }
 assert_forge_not_called() {  # <case_dir> <msg>
-  assert_no_grep 'pr merge' "$1/gh-axi.log" "$2"
+  assert_no_grep '^pr merge' "$1/gh-axi.log" "$2"
 }
 
 commit_more() {  # <case_dir> <text>
@@ -402,7 +433,7 @@ test_verified_commit_merges_on_both_paths() {
   verify_pass "$case_dir"
   run "$case_dir" merge "$PR_MERGE" task-x1 "$PR_URL"
   expect_code 0 "$RC" "verified-pr: a verified PR head should merge"
-  assert_grep 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+  assert_grep "pr merge 9 --repo example/repo --match-head-commit $(cat "$case_dir/pr-head") --squash" "$case_dir/gh-axi.log" \
     "verified-pr: the forge merge lost its number, repo, or default method"
   pass "a genuinely verified commit merges on both paths with no new friction"
 }
@@ -466,14 +497,14 @@ test_override_is_loud_and_durable() {
   case_dir=$(make_case override-taken-pr no-mistakes)
   set +e
   FM_MERGE_OVERRIDE_ACK=$ACK fm "$case_dir" "$PR_MERGE" task-x1 "$PR_URL" \
-    --override-unverified "$reason" -- --squash --delete-branch \
+    --attended-override --override-unverified "$reason" -- --squash --delete-branch \
     > "$case_dir/ovr.out" 2> "$case_dir/ovr.err"
   RC=$?
   set -e
   expect_code 0 "$RC" "override-taken-pr: a complete override should merge the PR"
   assert_grep 'MERGING WITHOUT VERIFICATION EVIDENCE' "$case_dir/ovr.out" \
     "override-taken-pr: the override was quiet"
-  assert_grep 'pr merge 9 --repo example/repo --squash --delete-branch' "$case_dir/gh-axi.log" \
+  assert_grep "pr merge 9 --repo example/repo --match-head-commit $(cat "$case_dir/pr-head") --squash --delete-branch" "$case_dir/gh-axi.log" \
     "override-taken-pr: the override dropped the caller's forge arguments"
   assert_grep 'merged_unverified=' "$case_dir/state/task-x1.meta" \
     "override-taken-pr: the override left no durable record"
@@ -536,31 +567,37 @@ test_pr_refuses_unknown_head() {
 
   run "$case_dir" merge "$PR_MERGE" task-x1 "$PR_URL"
 
-  expect_code 4 "$RC" "pr-unknown-head: merge should refuse when the head cannot be resolved"
-  assert_grep 'did not report a head commit' "$case_dir/merge.err" \
+  # bin/fm-pr-check.sh owns this refusal now: with no forge head it will not
+  # record a local head nothing outside the worker copy can reach, so the merge
+  # stops before the live read whose head the gate binds to.
+  expect_code 1 "$RC" "pr-unknown-head: merge should refuse when the head cannot be resolved"
+  assert_grep 'is unreachable outside the worker copy' "$case_dir/merge.err" \
     "pr-unknown-head: refusal did not name the unresolvable head"
   assert_forge_not_called "$case_dir" "pr-unknown-head: the forge merged an unidentifiable commit"
   pass "PR merge refuses when the forge cannot report the head commit to bind evidence to"
 }
 
-# --- (o) evidence survives the worktree it was produced in ------------------
+# --- (o) a returned worktree is a refusal, never an override -----------------
 
-test_pr_resolves_head_after_worktree_returned() {
-  local case_dir head
+test_pr_refuses_after_worktree_returned() {
+  local case_dir
   case_dir=$(make_case pr-worktree-returned no-mistakes)
   verify_pass "$case_dir"
-  head=$(tip "$case_dir")
   git -C "$case_dir/myproj" worktree remove --force "$case_dir/wt"
   assert_absent "$case_dir/wt" "pr-worktree-returned: fixture did not return the worktree"
 
   run "$case_dir" merge "$PR_MERGE" task-x1 "$PR_URL"
 
-  expect_code 0 "$RC" "pr-worktree-returned: the verified head should still merge"
-  assert_grep "verified: $head" "$case_dir/merge.out" \
-    "pr-worktree-returned: the gate did not resolve the head from the forge"
-  assert_grep 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
-    "pr-worktree-returned: the forge merge did not happen"
-  pass "a returned worktree still resolves the PR head, so evidence is not lost to cleanup"
+  # bin/fm-pr-check.sh will not record a head it cannot check against the
+  # worker copy, so the merge stops there. What matters to this gate is that the
+  # way forward is not --override-unverified: the evidence was never the problem.
+  expect_code 1 "$RC" "pr-worktree-returned: a head that cannot be checked should refuse"
+  assert_grep 'named head cannot be verified: worktree missing' "$case_dir/merge.err" \
+    "pr-worktree-returned: the refusal did not name the returned worktree"
+  assert_no_grep 'override-unverified' "$case_dir/merge.err" \
+    "pr-worktree-returned: a returned worktree was presented as a verification override"
+  assert_forge_not_called "$case_dir" "pr-worktree-returned: the forge was asked to merge anyway"
+  pass "a returned worktree refuses the PR merge without turning it into an override"
 }
 
 # --- (p) the override's own record must not cost the task its metadata ------
@@ -992,7 +1029,7 @@ test_post_rebase_tier_verifies_and_merges() {
     else
       run "$case_dir" merge "$PR_MERGE" task-x1 "$PR_URL"
       expect_code 0 "$RC" "rebase-merges-$mode: the post-rebase-verified PR head should merge"
-      assert_grep 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
+      assert_grep "pr merge 9 --repo example/repo --match-head-commit $(cat "$case_dir/pr-head") --squash" "$case_dir/gh-axi.log" \
         "rebase-merges-$mode: the forge was not asked to merge"
     fi
     assert_grep "post-rebase of $prior" "$case_dir/merge.out" \
@@ -1382,7 +1419,7 @@ test_override_is_loud_and_durable
 test_verify_refuses_dirty_worktree
 test_verify_records_gitignored_cache
 test_pr_refuses_unknown_head
-test_pr_resolves_head_after_worktree_returned
+test_pr_refuses_after_worktree_returned
 test_override_note_keeps_pr_metadata_parseable
 test_override_refuses_when_metadata_cannot_be_rewritten
 test_repeated_identical_override_still_records
